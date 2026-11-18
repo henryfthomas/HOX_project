@@ -1,0 +1,1229 @@
+---
+title: "FRAP: bootstrap of the tri-exponential fits to the slow-regime average curves"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+if (!requireNamespace("minpack.lm", quietly = TRUE)) install.packages("minpack.lm")
+library(minpack.lm)
+```
+
+Bootstrap of the slow-regime tri-exponential fits (companion to
+`FRAP_slow_triexp_fit.Rmd`; the fitting functions are copied from there).
+
+Each iteration resamples the slow ROIs of a cell line with replacement (all
+replicates pooled), averages them, and fits the same resampled curve in 9
+versions (all unweighted, full multi-start):
+
+| version | taken from the quick bi-exponential bootstrap |
+|---|---|
+| unconstrained | nothing |
+| k1,k2 fixed | k1, k2 held exactly |
+| k1,k2 bounded | k1, k2 within value ± 1 SD |
+| frac fixed | frac_A1, k1, frac_A2, k2 held exactly (C free, A = frac × (1 − C)) |
+| frac bounded | frac_A1, k1, frac_A2, k2 within value ± 1 SD |
+
+Every constrained version is run with two sources of the quick values:
+
+* **median**: the quick bootstrap medians, in every iteration
+* **random**: one randomly drawn quick bootstrap iteration per slow iteration
+  (all constrained values from that same quick iteration; both random-draw
+  versions of one slow iteration use the same draw). Bounded boxes are centered
+  on the drawn values, width ± 1 SD of the quick bootstrap.
+
+Cell lines: HOXC10, HOXC13, HOXC10-13-10, HOXC13-10-13. Comparisons (tests and
+violin plots): HOXC10 vs HOXC13, HOXC10-13-10 vs HOXC10, HOXC13 vs
+HOXC13-10-13.
+
+## Parameters
+
+```{r params}
+slow_curve_folder  <- "/Volumes/lionnt01lab/lionnt01labspace/Henry/FRAP/2026_08_analyze_all_3_slow_recovery_replicates/bootstrap_analysis"
+quick_curve_folder <- "/Volumes/lionnt01lab/lionnt01labspace/Henry/FRAP/2026_08_analyze_all_3_quick_recovery_replicates/bootstrap_analysis"
+# per-iteration csvs of the quick script's bi-exponential bootstrap
+quick_bootstrap_folder <- file.path(quick_curve_folder, "bootstrap_results")
+recursive <- TRUE
+
+channel_to_model     <- "Halo-JFx650"
+bootstrap_cell_lines <- c("HOXC10", "HOXC13", "HOXC10-13-10", "HOXC13-10-13")
+
+# Pairwise comparisons (tests and plots). Order = left/right in the plots, and
+# direction of the differences (first - second) in the p-value plots.
+comparisons <- list(c("HOXC10",       "HOXC13"),
+                    c("HOXC10-13-10", "HOXC10"),
+                    c("HOXC13",       "HOXC13-10-13"))
+
+bleach_time <- 0   # csvs are already zeroed to the bleach event
+
+# --- bootstrap ----------------------------------------------------------------
+# TRUE: run the bootstrap and save the iterations.
+# FALSE: read the previously saved iterations from export_folder instead.
+run_bootstrap          <- FALSE
+n_bootstrap_iterations <- 1000
+set.seed(42)
+
+# discard rules (same as the original scripts)
+max_plateau_sum <- 1.5   # C + A1 + A2 + A3 above this -> discarded
+
+# --- fitting ------------------------------------------------------------------
+# Multi-start: n_start_taus log-spaced time constants between the shortest frame
+# interval and the last time point. Unconstrained fit: every combination of 3 of
+# them is one start (6 -> 20 starts). Constrained fits: each one is a start for
+# k3. The best start that converged is kept.
+n_start_taus <- 6
+n_sd_bounds  <- 1        # bounded: value +/- n_sd_bounds * SD
+
+# --- plots --------------------------------------------------------------------
+cell_line_colors <- c(
+  "HOXC10"       = "#2888c2",
+  "HOXC10-13-10" = "#fd963a",
+  "HOXC13"       = "#b81d19",
+  "HOXC13-10-13" = "#8170b5"
+)
+
+status_colors <- c(kept                = "#4DAF4A",
+                   fit_failed          = "#E41A1C",
+                   hit_iteration_limit = "#FF7F00",
+                   plateau_too_high    = "#984EA3",
+                   rate_at_lower_bound = "#377EB8")
+
+# violin shade (opacity of the cell-line color): full = estimated from the slow
+# data, lighter = bounded around the quick value, lightest = held at the quick value
+status_alpha <- c("estimated"         = 0.85,
+                  "tied (bounded)"    = 0.45,
+                  "inherited (fixed)" = 0.2)
+
+violin_params <- c("C", "A1", "A2", "A3", "k1", "k2", "k3", "tau_1", "tau_2", "tau_3",
+                   "frac_A1", "frac_A2", "frac_A3", "frac_unrecovered")
+
+# --- tests --------------------------------------------------------------------
+# Only these parameters form the Holm family (when estimated from the slow data).
+# The amplitudes A and rates k are tested too, but not counted in the correction
+# (fractions = A / (1 - C), tau = 1 / k carry the same information).
+holm_params <- c("C", "frac_A1", "frac_A2", "frac_A3", "frac_unrecovered",
+                 "tau_1", "tau_2", "tau_3")
+
+# Parameters that are plotted but never tested (no test, no power estimate D).
+# Empty: every plotted parameter is tested.
+untested_params <- character(0)
+
+# --- optional: how the p-values are derived -----------------------------------
+# One version from the table below (e.g. "frac bounded | random"), or NULL to skip.
+# For this version: difference histograms and single-version violins per comparison.
+diff_plot_version <- "k1,k2 bounded | random"
+# Parameters to show for that version; NULL = all tested parameters.
+diff_plot_params  <- NULL
+# Significance level for the minimum significant difference D (power estimate).
+D_alpha <- 0.05/5
+# Selected fit: parameters whose single-version violins are exported as PDFs
+# (one PDF per parameter and comparison), together with the composition plots.
+pdf_violin_params <- c("C", "frac_A1", "frac_A2", "frac_A3", "frac_unrecovered",
+                       "tau_1", "tau_2", "tau_3")
+# Selected fit: parameters whose violins (shown and PDF) get a log10 y axis.
+# All other violin plots have a linear y axis that starts at 0 (or lower, if
+# there are negative values).
+log_y_params <- c("tau_3")
+# Lower end of those log10 axes; ticks at powers of ten (10^0, 10^1, 10^2, ...).
+# Values below this limit are not shown.
+log_y_lower  <- 1
+# Selected fit: parameters plotted once with all four cell lines side by side,
+# with the brackets of the three tested comparisons (shown and exported as PDF).
+all_lines_params <- c("tau_3")
+# x-axis order of that plot (brackets between non-neighbours are stacked above)
+all_lines_order  <- c("HOXC10", "HOXC10-13-10", "HOXC13-10-13", "HOXC13")
+
+# --- export -------------------------------------------------------------------
+export_folder <- file.path(slow_curve_folder, "slow_triexp_bootstrap")
+dir.create(export_folder, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Versions
+
+```{r versions}
+families <- list("k1,k2"                 = c("k1", "k2"),
+                 "frac_A1,k1,frac_A2,k2" = c("frac_A1", "k1", "frac_A2", "k2"))
+family_label <- c("k1,k2" = "k1,k2", "frac_A1,k1,frac_A2,k2" = "frac")
+
+versions <- expand_grid(family = names(families),
+                        mode   = c("fixed", "bounded"),
+                        source = c("median", "random")) %>%
+  mutate(version = paste0(family_label[family], " ", mode, " | ", source))
+versions <- bind_rows(
+  tibble(family = "unconstrained", mode = "free", source = "none", version = "unconstrained"),
+  versions
+)
+version_levels <- versions$version
+
+versions %>% knitr::kable()
+```
+
+## Read slow-regime curves
+
+```{r read}
+files <- list.files(slow_curve_folder, pattern = "_individual_curves\\.csv$",
+                    full.names = TRUE, recursive = recursive)
+if (length(files) == 0) stop("No *_individual_curves.csv found in ", slow_curve_folder)
+
+slow_curves <- files %>%
+  map_dfr(read_csv, show_col_types = FALSE) %>%
+  filter(!is.na(ratio_targeted_to_untargeted),
+         channel == channel_to_model,
+         cell_line %in% bootstrap_cell_lines) %>%
+  mutate(curve_id = paste(replicate, roi_id, sep = " | "))
+
+slow_curves %>%
+  distinct(cell_line, curve_id) %>%
+  count(cell_line, name = "n_rois")
+```
+
+## Quick bi-exponential values
+
+Median and SD per parameter over the converged quick bootstrap iterations
+(`frac_A1`, `frac_A2` computed per iteration as `A / (1 - C)` if the quick
+export has no `frac_*` columns). A zero or missing SD is replaced by 5 % of the
+median. `pct_iter_k1_below_k2` is the share of quick iterations whose own k1 < k2;
+those can be drawn in the "random" versions (flagged as `k1_below_k2` there).
+
+```{r quick-priors}
+quick_boot_files <- list.files(quick_bootstrap_folder,
+                               pattern = "_bootstrap_iterations\\.csv$",
+                               full.names = TRUE, recursive = TRUE)
+if (length(quick_boot_files) == 0)
+  stop("No quick bootstrap iteration csvs found in ", quick_bootstrap_folder)
+
+quick_boot <- quick_boot_files %>%
+  map_dfr(read_csv, show_col_types = FALSE) %>%
+  filter(converged, channel == channel_to_model, cell_line %in% bootstrap_cell_lines)
+
+if (!all(c("frac_A1", "frac_A2") %in% names(quick_boot))) {
+  quick_boot <- quick_boot %>% mutate(frac_A1 = A1 / (1 - C), frac_A2 = A2 / (1 - C))
+}
+
+quick_names <- c("C", "A1", "k1", "A2", "k2", "frac_A1", "frac_A2")
+
+quick_prior <- quick_boot %>%
+  group_by(cell_line) %>%
+  summarize(
+    n_quick_iterations   = n(),
+    pct_iter_k1_below_k2 = 100 * mean(k1 < k2),
+    across(all_of(quick_names),
+           list(median = ~median(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+missing_lines <- setdiff(bootstrap_cell_lines, quick_prior$cell_line)
+if (length(missing_lines) > 0)
+  stop("No quick bootstrap values for: ", paste(missing_lines, collapse = ", "))
+
+bad_order <- quick_prior %>% filter(k1_median < k2_median)
+if (nrow(bad_order) > 0) {
+  msg <- paste0("Quick bootstrap medians have k1 < k2 for: ",
+                paste(bad_order$cell_line, collapse = ", "),
+                ". Constraining would swap the meaning of components 1 and 2 - stopping.")
+  warning(msg)
+  stop(msg)
+}
+
+quick_prior %>% knitr::kable(digits = 4)
+
+quick_median <- function(cl) {
+  r <- quick_prior %>% filter(cell_line == cl) %>% slice(1)
+  setNames(unlist(r[paste0(quick_names, "_median")]), quick_names)
+}
+quick_sd <- function(cl) {
+  r <- quick_prior %>% filter(cell_line == cl) %>% slice(1)
+  val <- setNames(unlist(r[paste0(quick_names, "_median")]), quick_names)
+  sdv <- setNames(unlist(r[paste0(quick_names, "_sd")]), quick_names)
+  bad <- !(is.finite(sdv) & sdv > 0)
+  sdv[bad] <- pmax(abs(val[bad]) * 0.05, 1e-6)
+  sdv
+}
+```
+
+## Fitting functions
+
+Copied from `FRAP_slow_triexp_fit.Rmd`, extended to report why a fit was not
+usable:
+
+* `fit_failed`: every start threw an error
+* `hit_iteration_limit`: at least one start returned, but none converged
+  (optimizer stopped at its iteration / function-evaluation limit)
+
+Otherwise the best converged start is used.
+
+$$y = C + A_1\left(1-e^{-k_1 t}\right) + A_2\left(1-e^{-k_2 t}\right) + A_3\left(1-e^{-k_3 t}\right)$$
+
+```{r fit-helpers}
+predict_tri <- function(p, t) {
+  p[["C"]] +
+    p[["A1"]] * (1 - exp(-p[["k1"]] * t)) +
+    p[["A2"]] * (1 - exp(-p[["k2"]] * t)) +
+    p[["A3"]] * (1 - exp(-p[["k3"]] * t))
+}
+
+start_tau_grid <- function(t) {
+  t_pos <- sort(unique(t[t > 0]))
+  exp(seq(log(min(diff(c(0, t_pos)))), log(max(t)), length.out = n_start_taus))
+}
+
+nls_control <- nls.lm.control(maxiter = 500, maxfev = 5000, ftol = 1e-10, ptol = 1e-10)
+
+# nls.lm info codes 5 (maxfev) and 9 (maxiter) = stopped at a limit; 0 = bad input
+pick_best <- function(outs) {
+  returned <- Filter(function(o) !is.null(o) && o$info != 0, outs)
+  if (length(returned) == 0) return(list(status = "fit_failed"))
+  conv <- Filter(function(o) !(o$info %in% c(5, 9)), returned)
+  if (length(conv) == 0) return(list(status = "hit_iteration_limit"))
+  objs <- vapply(conv, function(o) sum(o$fvec^2), numeric(1))
+  list(status = "ok", out = conv[[which.min(objs)]])
+}
+
+# ---- unconstrained -----------------------------------------------------------
+# internal (C, A1, A2, A3, k3, d2, d1) -> natural; k1 >= k2 >= k3 by construction
+to_natural_unc <- function(q) {
+  c(C  = q[["C"]],
+    A1 = q[["A1"]], k1 = q[["k3"]] + q[["d2"]] + q[["d1"]],
+    A2 = q[["A2"]], k2 = q[["k3"]] + q[["d2"]],
+    A3 = q[["A3"]], k3 = q[["k3"]])
+}
+
+fit_unconstrained <- function(t, y) {
+  combos   <- combn(start_tau_grid(t), 3, simplify = FALSE)
+  C0       <- min(max(y[which.min(t)], 0), 1)
+  plateau0 <- mean(tail(y[order(t)], max(3, round(length(y) * 0.1))))
+  A0       <- max(plateau0 - C0, 0.01) / 3
+
+  resid_fn <- function(q) y - predict_tri(to_natural_unc(q), t)
+  lower <- c(C = 0, A1 = 0,   A2 = 0,   A3 = 0,   k3 = 0,   d2 = 0,   d1 = 0)
+  upper <- c(C = 1, A1 = Inf, A2 = Inf, A3 = Inf, k3 = Inf, d2 = Inf, d1 = Inf)
+
+  outs <- lapply(combos, function(taus) {
+    k <- sort(1 / taus, decreasing = TRUE)
+    start <- c(C = C0, A1 = A0, A2 = A0, A3 = A0,
+               k3 = k[3], d2 = k[2] - k[3], d1 = k[1] - k[2])
+    tryCatch(nls.lm(par = start, lower = lower, upper = upper,
+                    fn = resid_fn, control = nls_control),
+             error = function(e) NULL)
+  })
+
+  best <- pick_best(outs)
+  if (best$status != "ok") return(list(status = best$status))
+  par <- to_natural_unc(best$out$par)
+  list(status = "ok", par = par, rss = sum((y - predict_tri(par, t))^2))
+}
+
+# ---- constrained -------------------------------------------------------------
+# k3 = s * k2 with 0 <= s <= 1, so k3 <= k2.
+# Fraction version: A1 = frac_A1 * (1 - C), A2 = frac_A2 * (1 - C).
+to_natural_con <- function(q) {
+  if ("frac_A1" %in% names(q)) {
+    A1 <- q[["frac_A1"]] * (1 - q[["C"]])
+    A2 <- q[["frac_A2"]] * (1 - q[["C"]])
+  } else {
+    A1 <- q[["A1"]]
+    A2 <- q[["A2"]]
+  }
+  c(C = q[["C"]], A1 = A1, k1 = q[["k1"]], A2 = A2, k2 = q[["k2"]],
+    A3 = q[["A3"]], k3 = q[["s"]] * q[["k2"]])
+}
+
+# center: quick values used as fixed values / box centers / starting values
+# sdv:    quick SDs (box width)
+fit_constrained <- function(t, y, constr, mode, center, sdv) {
+  use_frac  <- any(c("frac_A1", "frac_A2") %in% constr)
+  int_names <- if (use_frac) c("C", "frac_A1", "k1", "frac_A2", "k2", "A3", "s")
+               else          c("C", "A1",      "k1", "A2",      "k2", "A3", "s")
+  pv <- center
+
+  C0       <- min(max(y[which.min(t)], 0), 1)
+  plateau0 <- mean(tail(y[order(t)], max(3, round(length(y) * 0.1))))
+
+  if (use_frac) {
+    base <- c(C = C0, frac_A1 = max(pv[["frac_A1"]], 1e-3), k1 = pv[["k1"]],
+              frac_A2 = max(pv[["frac_A2"]], 1e-3), k2 = pv[["k2"]], A3 = NA, s = NA)
+  } else {
+    base <- c(C = C0, A1 = max(pv[["A1"]], 1e-3), k1 = pv[["k1"]],
+              A2 = max(pv[["A2"]], 1e-3), k2 = pv[["k2"]], A3 = NA, s = NA)
+  }
+  base[constr] <- pv[constr]
+  nat0 <- to_natural_con(replace(base, c("A3", "s"), 0))
+  base[["A3"]] <- max(plateau0 - (nat0[["C"]] + nat0[["A1"]] + nat0[["A2"]]), 1e-3)
+
+  lower <- setNames(rep(0, 7), int_names)
+  upper <- setNames(rep(Inf, 7), int_names)
+  upper[c("C", "s")] <- 1
+
+  if (mode == "bounded") {
+    for (nm in constr) {
+      lower[[nm]] <- max(lower[[nm]], pv[[nm]] - n_sd_bounds * sdv[[nm]])
+      upper[[nm]] <- min(upper[[nm]], pv[[nm]] + n_sd_bounds * sdv[[nm]])
+      if (upper[[nm]] <= lower[[nm]]) upper[[nm]] <- lower[[nm]] + 1e-8
+    }
+  }
+
+  fixed_names <- if (mode == "fixed") constr else character(0)
+  free_names  <- setdiff(int_names, fixed_names)
+
+  template <- NULL
+  resid_fn <- function(q) {
+    par <- template
+    par[names(q)] <- q
+    y - predict_tri(to_natural_con(par), t)
+  }
+
+  s_grid <- unique(pmin(1, (1 / start_tau_grid(t)) / max(base[["k2"]], 1e-12)))
+
+  outs <- lapply(s_grid, function(s0) {
+    start <- base
+    start[["s"]] <- s0
+    start <- pmin(pmax(start, lower), upper)
+    template <<- start
+    out <- tryCatch(nls.lm(par = start[free_names], lower = lower[free_names],
+                           upper = upper[free_names], fn = resid_fn,
+                           control = nls_control),
+                    error = function(e) NULL)
+    if (!is.null(out)) {
+      q <- template
+      q[names(out$par)] <- out$par
+      out$q_full <- q
+    }
+    out
+  })
+
+  best <- pick_best(outs)
+  if (best$status != "ok") return(list(status = best$status))
+  par <- to_natural_con(best$out$q_full)
+  list(status = "ok", par = par, rss = sum((y - predict_tri(par, t))^2))
+}
+
+derive_params <- function(p) {
+  C <- p[["C"]]
+  A <- c(p[["A1"]], p[["A2"]], p[["A3"]])
+  k <- c(p[["k1"]], p[["k2"]], p[["k3"]])
+  tibble(
+    C = C, A1 = A[1], A2 = A[2], A3 = A[3],
+    k1 = k[1], k2 = k[2], k3 = k[3],
+    tau_1 = 1 / k[1], tau_2 = 1 / k[2], tau_3 = 1 / k[3],
+    frac_A1 = A[1] / (1 - C), frac_A2 = A[2] / (1 - C), frac_A3 = A[3] / (1 - C),
+    frac_unrecovered = 1 - sum(A) / (1 - C),
+    plateau = C + sum(A)
+  )
+}
+```
+
+## Run the bootstrap
+
+Discard rules (as in the original scripts), checked in this order:
+`fit_failed`, `hit_iteration_limit`, `plateau_too_high` (C + A1 + A2 + A3 >
+`max_plateau_sum`), `rate_at_lower_bound` (k3 = 0, tau_3 undefined). Discarded
+fits that did return parameters keep them in the saved csv, but only `kept`
+iterations go into the violins and tests.
+
+```{r bootstrap-run}
+iteration_file <- function(cl) {
+  file.path(export_folder, paste0(cl, "_", channel_to_model,
+                                  "_slow_triexp_bootstrap_iterations.csv"))
+}
+
+run_one_cell_line <- function(cl) {
+  cd <- slow_curves %>% filter(cell_line == cl)
+
+  # ROI x frame matrix (one row per ROI); averaging = column means of drawn rows
+  frame_time <- cd %>% group_by(frame) %>% summarize(time = first(time), .groups = "drop") %>%
+    arrange(frame)
+  wide <- cd %>%
+    select(curve_id, frame, ratio_targeted_to_untargeted) %>%
+    pivot_wider(names_from = frame, values_from = ratio_targeted_to_untargeted)
+  mat <- as.matrix(wide[, as.character(frame_time$frame)])
+  n_rois <- nrow(mat)
+
+  med <- quick_median(cl)
+  sdv <- quick_sd(cl)
+  qpool <- quick_boot %>% filter(cell_line == cl)
+
+  message(sprintf("Bootstrapping %s: %d ROIs, %d iterations, %d versions ...",
+                  cl, n_rois, n_bootstrap_iterations, nrow(versions)))
+
+  rows <- vector("list", n_bootstrap_iterations * nrow(versions))
+  r <- 0
+
+  for (iter in seq_len(n_bootstrap_iterations)) {
+    if (iter %% 100 == 0) message(sprintf("  %s: iteration %d", cl, iter))
+
+    idx <- sample.int(n_rois, n_rois, replace = TRUE)
+    y_all <- colMeans(mat[idx, , drop = FALSE], na.rm = TRUE)
+    keep_pts <- is.finite(y_all) & frame_time$time >= bleach_time
+    t <- frame_time$time[keep_pts] - bleach_time
+    y <- y_all[keep_pts]
+
+    # one quick draw per slow iteration, shared by all "random" versions
+    q_i  <- sample.int(nrow(qpool), 1)
+    drawn <- setNames(unlist(qpool[q_i, quick_names]), quick_names)
+
+    for (v in seq_len(nrow(versions))) {
+      ver <- versions[v, ]
+
+      res <- if (ver$family == "unconstrained") {
+        fit_unconstrained(t, y)
+      } else {
+        center <- if (ver$source == "median") med else drawn
+        fit_constrained(t, y, families[[ver$family]], ver$mode, center, sdv)
+      }
+
+      status <- res$status
+      der <- NULL
+      if (status == "ok") {
+        der <- derive_params(res$par)
+        status <- if (der$plateau > max_plateau_sum) "plateau_too_high"
+                  else if (der$k3 <= 0)              "rate_at_lower_bound"
+                  else                               "kept"
+      }
+
+      row <- tibble(
+        cell_line = cl, iteration = iter, version = ver$version,
+        family = ver$family, mode = ver$mode, source = ver$source,
+        quick_iteration = if (ver$source == "random") q_i else NA_integer_,
+        n_unique_rois = length(unique(idx)), n_points = length(y),
+        status = status,
+        RSS = if (is.null(der)) NA_real_ else res$rss,
+        k3_at_k2 = if (is.null(der)) NA else
+          isTRUE(abs(der$k3 - der$k2) <= 1e-8 * max(der$k2, 1e-12)),
+        k1_below_k2 = if (is.null(der)) NA else der$k1 < der$k2
+      )
+      if (!is.null(der)) row <- bind_cols(row, der)
+
+      r <- r + 1
+      rows[[r]] <- row
+    }
+  }
+  bind_rows(rows)
+}
+
+if (run_bootstrap) {
+  boot <- map_dfr(bootstrap_cell_lines, function(cl) {
+    out <- run_one_cell_line(cl)
+    write_csv(out, iteration_file(cl))
+    out
+  })
+} else {
+  missing_files <- bootstrap_cell_lines[!file.exists(map_chr(bootstrap_cell_lines, iteration_file))]
+  if (length(missing_files) > 0)
+    stop("run_bootstrap = FALSE but no saved iterations for: ",
+         paste(missing_files, collapse = ", "))
+  boot <- map_dfr(bootstrap_cell_lines,
+                  ~ read_csv(iteration_file(.x), show_col_types = FALSE))
+}
+
+boot <- boot %>%
+  mutate(cell_line = factor(cell_line, levels = bootstrap_cell_lines),
+         version   = factor(version, levels = version_levels),
+         status    = factor(status, levels = names(status_colors)))
+
+boot_kept <- boot %>% filter(status == "kept")
+```
+
+## Fit status per version
+
+```{r status-plot, fig.width=14, fig.height=9}
+status_counts <- boot %>% count(cell_line, version, status, .drop = FALSE)
+
+status_counts %>%
+  pivot_wider(names_from = status, values_from = n) %>%
+  knitr::kable()
+
+ggplot(status_counts, aes(x = version, y = n, fill = status)) +
+  geom_col(width = 0.75) +
+  facet_wrap(~ cell_line, ncol = 2) +
+  scale_fill_manual(values = status_colors, drop = FALSE) +
+  labs(title = paste0(channel_to_model, " - bootstrap fit status"),
+       subtitle = paste0(n_bootstrap_iterations, " iterations per version"),
+       x = NULL, y = "Number of iterations", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+### Flags among kept iterations
+
+`k3_at_k2`: k3 ended up equal to k2 (no separate slower timescale; the k3
+distribution is then capped by k2). `k1_below_k2`: fast-component ordering
+flipped (possible in bounded versions, and in "random" versions when the drawn
+quick iteration itself had k1 < k2).
+
+```{r flags}
+boot_kept %>%
+  group_by(cell_line, version) %>%
+  summarize(n_kept          = n(),
+            pct_k3_at_k2    = 100 * mean(k3_at_k2),
+            pct_k1_below_k2 = 100 * mean(k1_below_k2),
+            .groups = "drop") %>%
+  knitr::kable(digits = 1)
+```
+
+## Goodness of fit (RSS)
+
+Kept iterations only, one plot per comparison. RSS also reflects how noisy each
+cell line's average curve is, so differences between cell lines are not only
+differences in fit quality.
+
+```{r rss-plot, fig.width=10, fig.height=5}
+comp_name <- function(pr) paste(pr[1], "vs", pr[2])
+
+for (pr in comparisons) {
+  d <- boot_kept %>%
+    filter(cell_line %in% pr) %>%
+    mutate(cell_line = factor(as.character(cell_line), levels = pr))
+  if (nrow(d) == 0) next
+
+  p <- ggplot(d, aes(x = version, y = RSS, fill = cell_line)) +
+    geom_violin(position = position_dodge(width = 0.8), width = 0.75, scale = "width",
+                trim = TRUE, color = "grey20", linewidth = 0.4, alpha = 0.7) +
+    stat_summary(aes(group = cell_line), fun = median, geom = "crossbar",
+                 position = position_dodge(width = 0.8), width = 0.3,
+                 color = "black", linewidth = 0.4) +
+    scale_x_discrete(limits = version_levels, drop = FALSE) +
+    scale_fill_manual(values = cell_line_colors) +
+    expand_limits(y = 0) +   # y axis starts at 0
+    labs(title = paste0(channel_to_model, " - RSS per bootstrap fit: ", comp_name(pr)),
+         x = NULL, y = "RSS", fill = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+  print(p)
+}
+```
+
+## Tests
+
+For each comparison, version and parameter, `P(A > B)` over all pairings of
+kept iterations (from ranks, i.e. Mann-Whitney U / (nA × nB)), two-sided
+p = 2 × min(P, 1 − P), floored at 1 / min(nA, nB).
+
+* **Not tested at all**: `untested_params` (empty by default; any parameter
+  listed there is still shown in the violin plots).
+* **Holm family**: the parameters in `holm_params` (C, frac_A1, frac_A2,
+  frac_A3, frac_unrecovered, tau_1, tau_2, tau_3) that are estimated from the
+  slow data in that version. Holm-corrected within each comparison and version.
+  There is no additional correction for the three comparisons.
+* **Not corrected** (tested, but not part of the Holm family):
+  * amplitudes A1, A2, A3 and rates k1, k2, k3
+  * parameters from the quick fit (held or bounded, and anything computed only
+    from them). Held ("fixed") parameters are tested only in the "random"
+    versions; in the "median" versions they are the same value every
+    iteration, so no test. Bounded parameters vary within their box and are
+    tested in both sources.
+
+```{r tests}
+param_deps <- list(C = "C", A1 = "A1", A2 = "A2", A3 = "A3",
+                   k1 = "k1", k2 = "k2", k3 = "k3",
+                   tau_1 = "k1", tau_2 = "k2", tau_3 = "k3",
+                   frac_A1 = c("C", "A1"), frac_A2 = c("C", "A2"),
+                   frac_A3 = c("C", "A3"),
+                   frac_unrecovered = c("C", "A1", "A2", "A3"))
+
+param_status <- function(prm, family, mode) {
+  if (family == "unconstrained") return("estimated")
+  constr <- families[[family]]
+  if (!(prm %in% constr || all(param_deps[[prm]] %in% constr))) return("estimated")
+  if (mode == "fixed") "inherited (fixed)" else "tied (bounded)"
+}
+
+p_to_stars <- function(p) {
+  case_when(is.na(p) ~ "NA", p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns")
+}
+
+compare_two <- function(a, b) {
+  a <- a[is.finite(a)]; b <- b[is.finite(b)]
+  na <- length(a); nb <- length(b)
+  if (na < 2 || nb < 2) return(NULL)
+  r    <- rank(c(a, b))
+  prob <- (sum(r[seq_len(na)]) - na * (na + 1) / 2) / (na * nb)
+  tibble(n1 = na, n2 = nb, median1 = median(a), median2 = median(b),
+         prob_1_greater = prob,
+         p_raw = 2 * min(prob, 1 - prob), p_floor = 1 / min(na, nb))
+}
+
+kept_long <- boot_kept %>%
+  select(cell_line, version, family, mode, source, all_of(violin_params)) %>%
+  mutate(cell_line = as.character(cell_line)) %>%
+  pivot_longer(all_of(violin_params), names_to = "parameter", values_to = "value") %>%
+  mutate(param_class = pmap_chr(list(parameter, family, mode), param_status))
+
+tests <- map_dfr(comparisons, function(pr) {
+  kept_long %>%
+    filter(cell_line %in% pr,
+           !parameter %in% untested_params,
+           !(param_class == "inherited (fixed)" & source == "median")) %>%
+    group_by(version, family, mode, source, parameter, param_class) %>%
+    group_modify(function(d, key) {
+      res <- compare_two(d$value[d$cell_line == pr[1]], d$value[d$cell_line == pr[2]])
+      if (is.null(res)) tibble() else res
+    }) %>%
+    ungroup() %>%
+    mutate(comparison = comp_name(pr), group1 = pr[1], group2 = pr[2], .before = 1)
+}) %>%
+  mutate(p_is_floor = p_raw < p_floor,
+         p_value    = pmax(p_raw, p_floor),
+         in_holm    = param_class == "estimated" & parameter %in% holm_params) %>%
+  group_by(comparison, version) %>%
+  mutate(p_adj = {
+    pa <- p_value                                   # not in the Holm family: uncorrected
+    pa[in_holm] <- p.adjust(p_value[in_holm], "holm")
+    pa
+  }) %>%
+  ungroup() %>%
+  mutate(significance = p_to_stars(p_adj),
+         p_adj_label  = paste0(ifelse(p_is_floor, "<", ""), sprintf("%.3g", p_adj)),
+         comparison   = factor(comparison, levels = map_chr(comparisons, comp_name)),
+         version      = factor(version, levels = version_levels),
+         parameter    = factor(parameter, levels = violin_params)) %>%
+  arrange(comparison, parameter, version)
+
+tests %>%
+  select(comparison, parameter, version, param_class, median1, median2, prob_1_greater,
+         p_value, p_adj = p_adj_label, holm_corrected = in_holm, significance) %>%
+  knitr::kable(digits = 4)
+
+write_csv(tests, file.path(export_folder,
+                           paste0(channel_to_model, "_slow_triexp_bootstrap_tests.csv")))
+```
+
+## Minimum significant difference D (power estimate)
+
+For each comparison, version and tested parameter: the difference between the
+two cell lines that would just reach p = `D_alpha` (≈ 50 % power), read from the
+distribution of all pairwise differences first − second:
+
+* observed difference `d_obs` = median of the pairwise differences
+* if `d_obs >= 0`: `D = d_obs - q(D_alpha / 2)` (distance from the center to the
+  lower `D_alpha / 2` quantile)
+* if `d_obs < 0`: `D = q(1 - D_alpha / 2) - d_obs` (distance to the upper quantile)
+
+`D` is an absolute difference (same units as the parameter), independent of
+where the observed difference lies: any true difference of at least `D` in
+that direction would come out significant at `D_alpha` (uncorrected, i.e. not
+taking Holm into account). It assumes the spread of the differences does not
+change when the difference grows. Shown as a bar plot under each violin plot.
+
+```{r min-sig-diff}
+min_sig_diff <- function(a, b, alpha = D_alpha) {
+  a <- a[is.finite(a)]; b <- b[is.finite(b)]
+  if (length(a) < 2 || length(b) < 2) return(NULL)
+  diffs <- as.vector(outer(a, b, "-"))
+  d_obs <- median(diffs)
+  q     <- quantile(diffs, c(alpha / 2, 1 - alpha / 2), names = FALSE)
+  D     <- if (d_obs >= 0) d_obs - q[1] else q[2] - d_obs
+  tibble(d_obs = d_obs, q_lower = q[1], q_upper = q[2], D = D,
+         already_significant = abs(d_obs) >= D)
+}
+
+D_keys <- tests %>% distinct(comparison, group1, group2, version, parameter)
+
+D_all <- pmap_dfr(D_keys, function(comparison, group1, group2, version, parameter) {
+  dv  <- kept_long %>% filter(version == !!version, parameter == !!as.character(parameter))
+  res <- min_sig_diff(dv$value[dv$cell_line == group1], dv$value[dv$cell_line == group2])
+  if (is.null(res)) return(NULL)
+  tibble(comparison = comparison, version = version, parameter = parameter) %>%
+    bind_cols(res) %>%
+    mutate(direction = if_else(d_obs >= 0, paste(group1, ">", group2),
+                               paste(group1, "<", group2)))
+}) %>%
+  mutate(comparison = factor(comparison, levels = map_chr(comparisons, comp_name)),
+         version    = factor(version, levels = version_levels),
+         parameter  = factor(parameter, levels = violin_params)) %>%
+  arrange(comparison, parameter, version)
+
+write_csv(D_all, file.path(export_folder,
+                           paste0(channel_to_model, "_slow_triexp_bootstrap_min_sig_diff.csv")))
+
+# bar plot of D for one parameter and comparison, same x axis as the violins
+plot_D_bar <- function(prm, pr, vers) {
+  d <- D_all %>% filter(parameter == prm, comparison == comp_name(pr), version %in% vers)
+  if (nrow(d) == 0) return(NULL)
+  ggplot(d, aes(x = version, y = D)) +
+    geom_col(width = 0.6, fill = "grey55", color = "grey20", linewidth = 0.3) +
+    scale_x_discrete(limits = vers, drop = FALSE) +
+    labs(title = paste0(channel_to_model, " - ", prm, ": ", comp_name(pr),
+                        " - minimum significant difference"),
+         subtitle = paste0("D for p = ", D_alpha, " (~50 % power, uncorrected); ",
+                           "no bar = not tested"),
+         x = NULL, y = paste0("D (", prm, ")")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## Violin plots per parameter and comparison
+
+Kept iterations; line = median. Shade of the cell-line color: full = estimated
+from the slow data; lighter = bounded around the quick value; lightest = held
+at the quick value. Above each pair: significance of the comparison
+(Holm-corrected for the Holm family; marked `°` = uncorrected: amplitudes A,
+rates k, or parameter from the quick fit). No label = not tested.
+
+```{r violin-function}
+dodge_w <- 0.8
+
+# log10 y axis starting exactly at log_y_lower, ticks and labels at powers of ten
+log_y_scale <- function() {
+  scale_y_log10(limits = c(log_y_lower, NA),
+                breaks = 10^(-6:9),
+                labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                expand = expansion(mult = c(0, 0.05)))
+}
+
+# Violins of one parameter for the two cell lines of one comparison, for the
+# versions in `vers`, with the test result above each pair.
+# log_y = FALSE: linear y axis that starts at 0 (or lower, if values are negative).
+# log_y = TRUE:  log10 y axis (only positive values can be shown).
+plot_param_violin <- function(prm, pr, vers, log_y = FALSE) {
+  d <- kept_long %>%
+    filter(parameter == prm, cell_line %in% pr, version %in% vers, is.finite(value)) %>%
+    mutate(cell_line   = factor(cell_line, levels = pr),
+           param_class = factor(param_class, levels = names(status_alpha)))
+  if (nrow(d) == 0) return(NULL)
+
+  span <- diff(range(d$value)); if (!is.finite(span) || span == 0) span <- max(abs(d$value), 1e-9)
+
+  br <- tests %>%
+    filter(parameter == prm, comparison == comp_name(pr), version %in% vers) %>%
+    mutate(version = as.character(version)) %>%
+    inner_join(d %>% mutate(version = as.character(version)) %>%
+                 group_by(version) %>% summarize(y_max = max(value), .groups = "drop"),
+               by = "version") %>%
+    mutate(x  = match(version, vers),
+           x1 = x - dodge_w / 4, x2 = x + dodge_w / 4,
+           y  = y_max + 0.06 * span,
+           label = paste0(significance, ifelse(in_holm, "", "°")))
+
+  p <- ggplot(d, aes(x = version, y = value, fill = cell_line)) +
+    geom_violin(aes(alpha = param_class, group = interaction(version, cell_line)),
+                position = position_dodge(width = dodge_w), width = 0.75,
+                scale = "width", trim = TRUE, color = "grey15", linewidth = 0.4) +
+    stat_summary(aes(group = cell_line), fun = median, geom = "crossbar",
+                 position = position_dodge(width = dodge_w), width = 0.3,
+                 color = "black", linewidth = 0.4) +
+    scale_x_discrete(limits = vers, drop = FALSE) +
+    scale_fill_manual(values = cell_line_colors) +
+    scale_alpha_manual(values = status_alpha, drop = FALSE, name = "Shade",
+                       guide = guide_legend(override.aes = list(fill = "grey30"))) +
+    labs(title = paste0(channel_to_model, " - ", prm, ": ", comp_name(pr)),
+         x = NULL, y = prm, fill = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "bottom", legend.box = "vertical")
+
+  if (nrow(br) > 0) {
+    p <- p +
+      geom_segment(data = br, aes(x = x1, xend = x2, y = y, yend = y),
+                   inherit.aes = FALSE, linewidth = 0.4) +
+      geom_text(data = br, aes(x = x, y = y, label = label),
+                inherit.aes = FALSE, vjust = -0.3, size = 3.2) +
+      geom_blank(data = br, aes(x = x, y = y + 0.08 * span), inherit.aes = FALSE)
+  }
+  if (log_y) p + log_y_scale() else p + expand_limits(y = 0)
+}
+```
+
+```{r violins, fig.width=11, fig.height=5.5}
+for (prm in violin_params) {
+  for (pr in comparisons) {
+    p <- plot_param_violin(prm, pr, version_levels)
+    if (!is.null(p)) print(p)
+    pD <- plot_D_bar(prm, pr, version_levels)
+    if (!is.null(pD)) print(pD)
+  }
+}
+```
+
+## Optional: the selected fit (`diff_plot_version`)
+
+Only runs when `diff_plot_version` is set.
+
+### How the p-values are derived
+
+For each comparison and each tested parameter: the histogram of all pairwise
+differences first − second cell line (every kept iteration of the first paired
+with every kept iteration of the second). The share of pairs right of 0 is
+P(first > second), the share left of 0 is 1 − P (exact ties count half). The
+smaller side is shaded; the raw p-value is twice the shaded share (then floored
+at 1 / n). Holm correction, where it applies, is done afterwards and is given as
+text only. The blue dashed line marks the minimum significant difference D
+(see the D section below), in the direction of the observed difference.
+
+```{r diff-plot, fig.width=10, fig.height=8}
+if (!is.null(diff_plot_version)) {
+
+  if (!diff_plot_version %in% version_levels)
+    stop("diff_plot_version must be one of: ", paste(version_levels, collapse = "; "))
+
+  for (pr in comparisons) {
+    g1 <- pr[1]; g2 <- pr[2]
+
+    t_sel <- tests %>% filter(version == diff_plot_version, comparison == comp_name(pr))
+    if (!is.null(diff_plot_params)) t_sel <- t_sel %>% filter(parameter %in% diff_plot_params)
+    if (nrow(t_sel) == 0) { message("No tested parameters for ", comp_name(pr)); next }
+
+    bins_list  <- list()
+    annot_list <- list()
+
+    for (i in seq_len(nrow(t_sel))) {
+      prm <- as.character(t_sel$parameter[i])
+      dv  <- kept_long %>% filter(version == diff_plot_version, parameter == prm)
+      a <- dv$value[dv$cell_line == g1]; a <- a[is.finite(a)]
+      b <- dv$value[dv$cell_line == g2]; b <- b[is.finite(b)]
+
+      diffs <- as.vector(outer(a, b, "-"))
+      rng <- range(diffs)
+      if (diff(rng) == 0) next
+
+      # 0 is always a bin edge, so every bin is clearly left or right of 0
+      brks <- seq(rng[1], rng[2], length.out = 81)
+      if (rng[1] < 0 && rng[2] > 0) brks <- sort(unique(c(brks, 0)))
+      h <- hist(diffs, breaks = brks, plot = FALSE)
+
+      prob <- t_sel$prob_1_greater[i]
+      smaller_side <- if (prob < 0.5) "right" else "left"   # side holding the smaller share
+
+      # minimum significant difference D (same definition as in the D section
+      # below), drawn in the direction of the observed difference
+      d_obs <- median(diffs)
+      q     <- quantile(diffs, c(D_alpha / 2, 1 - D_alpha / 2), names = FALSE)
+      D     <- if (d_obs >= 0) d_obs - q[1] else q[2] - d_obs
+      D_x   <- if (d_obs >= 0) D else -D
+
+      bins_list[[length(bins_list) + 1]] <- tibble(
+        parameter = prm,
+        xmin = head(h$breaks, -1), xmax = tail(h$breaks, -1),
+        share = h$counts / length(diffs)
+      ) %>%
+        mutate(side   = if_else((xmin + xmax) / 2 > 0, "right", "left"),
+               shaded = side == smaller_side)
+
+      annot_list[[length(annot_list) + 1]] <- tibble(
+        parameter = prm,
+        D_x = D_x,
+        label = paste0(
+          "P(", g1, " > ", g2, ") = ", sprintf("%.3f", prob), "\n",
+          "raw p = 2 x ", sprintf("%.3f", min(prob, 1 - prob)), " = ",
+          sprintf("%.3g", t_sel$p_raw[i]),
+          if (t_sel$p_is_floor[i]) paste0(" -> floored to ", sprintf("%.3g", t_sel$p_value[i])) else "",
+          "\n",
+          if (t_sel$in_holm[i]) paste0("Holm-adjusted p = ", sprintf("%.3g", t_sel$p_adj[i]))
+          else "not Holm-corrected",
+          "\n", "D (p = ", D_alpha, ") = ", sprintf("%.3g", D_x)
+        )
+      )
+    }
+
+    if (length(bins_list) == 0) next
+    bins  <- bind_rows(bins_list)  %>% mutate(parameter = factor(parameter, levels = violin_params))
+    annot <- bind_rows(annot_list) %>% mutate(parameter = factor(parameter, levels = violin_params))
+
+    p <- ggplot(bins) +
+      geom_rect(aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = share, fill = shaded),
+                color = NA) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+      geom_vline(data = annot, aes(xintercept = D_x),
+                 linetype = "dashed", color = "#377EB8", linewidth = 0.7) +
+      geom_text(data = annot, aes(x = -Inf, y = Inf, label = label),
+                hjust = -0.03, vjust = 1.1, size = 2.8) +
+      scale_fill_manual(values = c(`TRUE` = "#E41A1C", `FALSE` = "grey65"),
+                        labels = c(`TRUE` = "smaller side (p = 2 x this share)",
+                                   `FALSE` = "larger side"),
+                        name = NULL) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.45))) +
+      facet_wrap(~ parameter, scales = "free", ncol = 3) +
+      labs(title = paste0(channel_to_model, " - ", diff_plot_version,
+                          ": pairwise differences ", g1, " - ", g2),
+           subtitle = paste0("All pairs of kept bootstrap iterations; black dashed = 0; ",
+                             "blue dashed = difference needed for p = ", D_alpha,
+                             " (D, uncorrected)"),
+           x = paste0(g1, " - ", g2), y = "Share of pairs") +
+      theme_minimal() +
+      theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+    print(p)
+  }
+}
+```
+
+### Violins of the selected fit
+
+One plot per parameter and comparison, showing only `diff_plot_version`.
+Above each plot: the median of the plotted values (kept iterations) for both
+cell lines. Parameters in `log_y_params` (tau_3) get a log10 y axis here and in the
+exported PDFs, starting at `log_y_lower` (1) with ticks at 10^0, 10^1, 10^2, ...;
+all others a linear y axis starting at 0.
+
+```{r selected-violins, fig.width=4.5, fig.height=5.5, results="asis"}
+if (!is.null(diff_plot_version)) {
+  sel_params <- if (is.null(diff_plot_params)) violin_params else diff_plot_params
+  for (prm in sel_params) {
+    for (pr in comparisons) {
+      p <- plot_param_violin(prm, pr, diff_plot_version, log_y = prm %in% log_y_params)
+      if (is.null(p)) next
+
+      # median of the plotted values (kept iterations), per cell line
+      med <- kept_long %>%
+        filter(version == diff_plot_version, parameter == prm,
+               cell_line %in% pr, is.finite(value)) %>%
+        group_by(cell_line) %>%
+        summarize(median = median(value), n_kept = n(), .groups = "drop") %>%
+        mutate(cell_line = factor(cell_line, levels = pr)) %>%
+        arrange(cell_line)
+
+      cat("\n\n**", prm, ": ", comp_name(pr), "**  \n",
+          paste0("median ", med$cell_line, " = ", signif(med$median, 4),
+                 " (n = ", med$n_kept, ")", collapse = "; "),
+          "\n\n", sep = "")
+
+      print(p + labs(subtitle = diff_plot_version))
+      cat("\n\n")
+    }
+  }
+}
+```
+
+### Minimum significant difference D
+
+D for the selected fit, taken from the D values computed for all versions
+(see "Minimum significant difference D" above the violin plots): table, and one
+bar plot per parameter with the three comparisons.
+
+```{r min-sig-diff-selected, fig.width=5, fig.height=4.5, results="asis"}
+if (!is.null(diff_plot_version)) {
+  D_sel <- D_all %>% filter(version == diff_plot_version)
+  if (!is.null(diff_plot_params)) D_sel <- D_sel %>% filter(parameter %in% diff_plot_params)
+  cat("\n\n")
+  print(knitr::kable(D_sel %>% arrange(parameter, comparison), digits = 5))
+  cat("\n\n")
+
+  # one bar plot per parameter: D for the three comparisons
+  for (prm in levels(droplevels(D_sel$parameter))) {
+    d <- D_sel %>% filter(parameter == prm)
+    p <- ggplot(d, aes(x = comparison, y = D)) +
+      geom_col(width = 0.6, fill = "grey55", color = "grey20", linewidth = 0.3) +
+      scale_x_discrete(drop = FALSE) +
+      labs(title = paste0(channel_to_model, " - ", prm, ": minimum significant difference"),
+           subtitle = paste0(diff_plot_version, "; p = ", D_alpha, " (~50 % power)"),
+           x = NULL, y = paste0("D (", prm, ")")) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+    print(p)
+    cat("\n\n")
+  }
+}
+```
+
+### Composition of the recovery
+
+One pair of stacked bars per comparison, from the kept bootstrap iterations of
+the selected fit:
+
+* **C and 1 − C**: median of C, and 1 − median(C) on top, so each bar adds up
+  to 1. Error bar: ± 1 SD of C across iterations, at the top of the C segment.
+* **Fractions**: medians of frac_A1, frac_A2, frac_A3 and frac_unrecovered
+  stacked (frac_A1 at the bottom). Each fraction's error bar (± 1 SD across
+  iterations) is drawn at the top of its own segment. A negative median
+  frac_unrecovered is not drawn (with a warning). Because each fraction's
+  median is taken separately, the stack does not have to add up to exactly 1.
+
+Both plots, and the single-version violins of `pdf_violin_params`, are saved as
+PDFs in `export_folder/pdf_selected_fit/<version>/`.
+
+```{r composition-plots, fig.width=4.5, fig.height=5.5, results="asis"}
+if (!is.null(diff_plot_version)) {
+
+  safe_name   <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+  sel_pdf_dir <- file.path(export_folder, "pdf_selected_fit", safe_name(diff_plot_version))
+  dir.create(sel_pdf_dir, showWarnings = FALSE, recursive = TRUE)
+
+  frac_comp   <- c("frac_A1", "frac_A2", "frac_A3", "frac_unrecovered")
+  frac_alpha  <- c(frac_A1 = 1, frac_A2 = 0.7, frac_A3 = 0.45, frac_unrecovered = 0.2)
+  C_alpha     <- c("C" = 0.9, "1 - C" = 0.25)
+
+  sel_stats <- boot_kept %>%
+    filter(version == diff_plot_version) %>%
+    mutate(cell_line = as.character(cell_line)) %>%
+    group_by(cell_line) %>%
+    summarize(n_kept = n(),
+              across(all_of(c("C", frac_comp)),
+                     list(median = ~median(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+                     .names = "{.col}_{.fn}"),
+              .groups = "drop")
+
+  cat("\n\n")
+  print(knitr::kable(sel_stats, digits = 4))
+  cat("\n\n")
+
+  # stacked bars drawn as rectangles: x = position of the cell line in the pair
+  stacked_plot <- function(seg, err, alpha_vals, title, ylab) {
+    ggplot() +
+      geom_rect(data = seg, aes(xmin = x - 0.35, xmax = x + 0.35, ymin = ymin, ymax = ymax,
+                                fill = cell_line, alpha = component),
+                color = "grey20", linewidth = 0.3) +
+      geom_errorbar(data = err, aes(x = x, ymin = y - sd, ymax = y + sd),
+                    width = 0.15, linewidth = 0.5) +
+      scale_x_continuous(breaks = seq_along(unique(seg$cell_line)),
+                         labels = unique(seg$cell_line), expand = expansion(add = 0.5)) +
+      scale_fill_manual(values = cell_line_colors, guide = "none") +
+      scale_alpha_manual(values = alpha_vals, name = NULL,
+                         guide = guide_legend(override.aes = list(fill = "grey30"),
+                                              reverse = TRUE)) +
+      labs(title = title, subtitle = diff_plot_version, x = NULL, y = ylab) +
+      theme_minimal() +
+      theme(legend.position = "right", panel.grid.major.x = element_blank())
+  }
+
+  for (pr in comparisons) {
+    st <- sel_stats %>% filter(cell_line %in% pr) %>%
+      mutate(x = match(cell_line, pr)) %>% arrange(x)
+    if (nrow(st) < 2) { message("Missing kept iterations for ", comp_name(pr)); next }
+
+    # ---- C and 1 - C ----
+    seg_C <- bind_rows(
+      st %>% transmute(cell_line, x, component = "C",     ymin = 0,        ymax = C_median),
+      st %>% transmute(cell_line, x, component = "1 - C", ymin = C_median, ymax = 1)
+    ) %>% mutate(component = factor(component, levels = names(C_alpha)))
+    err_C <- st %>% transmute(x, y = C_median, sd = C_sd)
+
+    pC <- stacked_plot(seg_C, err_C, C_alpha,
+                       paste0(channel_to_model, " - C and 1 - C: ", comp_name(pr)),
+                       "Fraction of pre-bleach intensity")
+    print(pC)
+    cat("\n\n")
+    ggsave(file.path(sel_pdf_dir, paste0("C_composition_", safe_name(comp_name(pr)), ".pdf")),
+           pC, width = 4.5, height = 5.5, device = "pdf")
+
+    # ---- fractions ----
+    seg_list <- list(); err_list <- list()
+    for (j in seq_len(nrow(st))) {
+      cl  <- st$cell_line[j]
+      med <- unlist(st[j, paste0(frac_comp, "_median")]); names(med) <- frac_comp
+      sdv <- unlist(st[j, paste0(frac_comp, "_sd")]);     names(sdv) <- frac_comp
+
+      comps <- frac_comp
+      if (!is.finite(med[["frac_unrecovered"]]) || med[["frac_unrecovered"]] < 0) {
+        warning(sprintf("%s (%s): median frac_unrecovered = %.4f is negative - not plotted.",
+                        cl, diff_plot_version, med[["frac_unrecovered"]]))
+        comps <- setdiff(comps, "frac_unrecovered")
+      }
+      tops <- cumsum(med[comps])
+      seg_list[[j]] <- tibble(cell_line = cl, x = st$x[j], component = comps,
+                              ymin = c(0, head(tops, -1)), ymax = tops)
+      err_list[[j]] <- tibble(x = st$x[j], y = tops, sd = sdv[comps])
+    }
+    seg_F <- bind_rows(seg_list) %>% mutate(component = factor(component, levels = frac_comp))
+    err_F <- bind_rows(err_list)
+
+    pF <- stacked_plot(seg_F, err_F, frac_alpha,
+                       paste0(channel_to_model, " - fractions of the bleached amount: ",
+                              comp_name(pr)),
+                       "Fraction of 1 - C")
+    print(pF)
+    cat("\n\n")
+    ggsave(file.path(sel_pdf_dir, paste0("fractions_composition_", safe_name(comp_name(pr)), ".pdf")),
+           pF, width = 4.5, height = 5.5, device = "pdf")
+  }
+
+  # ---- single-version violins as PDFs ----
+  for (prm in pdf_violin_params) {
+    for (pr in comparisons) {
+      p <- plot_param_violin(prm, pr, diff_plot_version, log_y = prm %in% log_y_params)
+      if (is.null(p)) next
+      ggsave(file.path(sel_pdf_dir, paste0("violin_", prm, "_", safe_name(comp_name(pr)), ".pdf")),
+             p + labs(subtitle = diff_plot_version), width = 4.5, height = 5.5, device = "pdf")
+    }
+  }
+
+  cat("\n\nPDFs saved in `", sel_pdf_dir, "`:\n\n",
+      paste0("* ", list.files(sel_pdf_dir), collapse = "\n"), "\n", sep = "")
+}
+```
+
+### All four cell lines in one plot
+
+For each parameter in `all_lines_params` (tau_3): one violin plot of the
+selected fit with all four cell lines, in the order `all_lines_order`. The
+brackets are the three comparisons that are already tested above
+(HOXC10 vs HOXC13, HOXC10-13-10 vs HOXC10, HOXC13 vs HOXC13-10-13), with exactly
+the same p-values and stars as in the per-comparison plots and the tests csv
+(Holm within each comparison's family; `°` = uncorrected). No new tests are run.
+Parameters in `log_y_params` get a log10 y axis. Exported as a PDF to the same
+`pdf_selected_fit/<version>/` folder.
+
+```{r all-lines-violins, fig.width=6, fig.height=5.5}
+if (!is.null(diff_plot_version)) {
+
+  safe_name   <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+  sel_pdf_dir <- file.path(export_folder, "pdf_selected_fit", safe_name(diff_plot_version))
+  dir.create(sel_pdf_dir, showWarnings = FALSE, recursive = TRUE)
+
+  for (prm in all_lines_params) {
+    log_y <- prm %in% log_y_params
+
+    d <- kept_long %>%
+      filter(version == diff_plot_version, parameter == prm,
+             cell_line %in% all_lines_order, is.finite(value)) %>%
+      { if (log_y) filter(., value > 0) else . } %>%
+      mutate(cell_line   = factor(cell_line, levels = all_lines_order),
+             param_class = factor(param_class, levels = names(status_alpha)))
+    if (nrow(d) == 0) { message("No kept iterations for ", prm); next }
+
+    y_max <- max(d$value)
+    span  <- diff(range(d$value)); if (!is.finite(span) || span == 0) span <- max(abs(y_max), 1e-9)
+
+    # brackets of the already tested comparisons; brackets that overlap are stacked
+    br <- tests %>%
+      filter(version == diff_plot_version, parameter == prm) %>%
+      mutate(x1 = match(group1, all_lines_order), x2 = match(group2, all_lines_order)) %>%
+      filter(!is.na(x1), !is.na(x2)) %>%
+      mutate(xa = pmin(x1, x2) + 0.05, xb = pmax(x1, x2) - 0.05,
+             label = paste0(significance, ifelse(in_holm, "", "°"))) %>%
+      arrange(xb - xa, xa)   # short brackets first, so longer ones are stacked above
+    if (nrow(br) > 0) {
+      lvl <- integer(nrow(br))
+      for (i in seq_len(nrow(br))) {
+        prev <- which(seq_len(nrow(br)) < i & br$xb > br$xa[i] & br$xa < br$xb[i])
+        lvl[i] <- if (length(prev) == 0) 1L else max(lvl[prev]) + 1L
+      }
+      br$level <- lvl
+      br <- br %>% mutate(
+        y       = if (log_y) y_max * 1.25^level       else y_max + 0.06 * span * level,
+        y_blank = if (log_y) y_max * 1.25^(level + 1) else y_max + 0.06 * span * (level + 1)
+      )
+    }
+
+    p <- ggplot(d, aes(x = cell_line, y = value, fill = cell_line)) +
+      geom_violin(aes(alpha = param_class), width = 0.75, scale = "width", trim = TRUE,
+                  color = "grey15", linewidth = 0.4) +
+      stat_summary(fun = median, geom = "crossbar", width = 0.3,
+                   color = "black", linewidth = 0.4) +
+      scale_fill_manual(values = cell_line_colors, guide = "none") +
+      scale_alpha_manual(values = status_alpha, drop = FALSE, name = "Shade",
+                         guide = guide_legend(override.aes = list(fill = "grey30"))) +
+      labs(title = paste0(channel_to_model, " - ", prm, ": all cell lines"),
+           subtitle = diff_plot_version, x = NULL, y = prm) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+
+    if (nrow(br) > 0) {
+      p <- p +
+        geom_segment(data = br, aes(x = xa, xend = xb, y = y, yend = y),
+                     inherit.aes = FALSE, linewidth = 0.4) +
+        geom_text(data = br, aes(x = (xa + xb) / 2, y = y, label = label),
+                  inherit.aes = FALSE, vjust = -0.3, size = 3.2) +
+        geom_blank(data = br, aes(x = (xa + xb) / 2, y = y_blank), inherit.aes = FALSE)
+    }
+    p <- if (log_y) p + log_y_scale() else p + expand_limits(y = 0)
+
+    print(p)
+    ggsave(file.path(sel_pdf_dir, paste0("violin_", prm, "_all_cell_lines.pdf")),
+           p, width = 6, height = 5.5, device = "pdf")
+  }
+}
+```

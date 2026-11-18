@@ -1,0 +1,11 @@
+n = roiManager("count");
+roiManager("Select", Array.getSequence(n));
+roiManager("Multi Measure");
+fileName = getTitle();;
+filePath = File.directory;
+fileName_mod = split(fileName, ".");
+saveAs("Results", filePath+fileName_mod[0]+"_results.csv");
+roiManager("Save", filePath+fileName_mod[0]+"_ROIs.zip");
+//roiManager("reset");
+run("Close");
+run("Close");

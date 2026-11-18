@@ -1,0 +1,2226 @@
+---
+title: "FRAP Data Analysis - Individual Curve Modeling with Bootstrap (violin y axes from 0)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+
+# minpack.lm provides nlsLM(), a Levenberg-Marquardt nonlinear least-squares
+# fitter that's more robust to imperfect starting values than base nls() -
+# used below for the exponential recovery fits.
+if (!requireNamespace("minpack.lm", quietly = TRUE)) {
+  install.packages("minpack.lm")
+}
+library(minpack.lm)
+```
+
+This script works from the **individual-curve** csv files exported by the
+main analysis script (`*_individual_curves.csv`, one per cell line per
+replicate - one row per region, per frame), rather than the already-averaged
+`*_mean_curve.csv` files. It:
+
+1. Reads all individual-curve files across every replicate and counts how
+   many individual curves (regions) are available per cell line/channel.
+2. Pools every individual curve into one average recovery curve per cell
+   line/channel.
+3. Fits mono-, bi-, and tri-exponential recovery models to those average
+   curves (for the channel(s) chosen below) and picks the best-fitting
+   model (lowest AIC) for each cell line/channel.
+4. For **every cell line**, runs a 1,000-iteration bootstrap: each
+   iteration randomly draws (with replacement, so the same curve can be
+   picked more than once) as many individual curves as are actually
+   available for that cell line/channel, averages them into a resampled
+   curve, and re-fits it with the model chosen in step 3. The resulting
+   1,000 sets of fit parameters are then summarized as a mean ± SD per
+   parameter.
+
+Point `curve_folder` at a folder that contains the exported
+`*_individual_curves.csv` files from all the replicates you want to
+combine (they can come from different `export_folder`s - just copy/collect
+them into one place first, or point this at a parent folder and set
+`recursive <- TRUE` if they're in per-replicate subfolders).
+
+## Parameters
+
+```{r params}
+curve_folder <- "/Volumes/lionnt01lab/lionnt01labspace/Henry/FRAP/2026_08_analyze_all_3_quick_recovery_replicates/bootstrap_analysis"   # <-- EDIT THIS
+recursive    <- TRUE   # set TRUE if curve csvs are in subfolders per replicate
+
+# --- which channel(s) to model ---
+# Everything before the "Model the average recovery curves" section
+# (reading files, counting curves, building average curves) is done for
+# every channel present in the data. Modeling, best-fit selection, and the
+# bootstrap below are restricted to the channel(s) listed here.
+channels_to_model <- c("Halo-JFx650")   # <-- EDIT: e.g. c("GFP", "Halo-JFx650")
+
+# Optional: restrict the *plots* below to specific cell lines, e.g.
+# c("H2B", "CTCF"). Does not affect any computation (fitting, bootstrap,
+# per-replicate fits, or the csv exports still cover every cell line) -
+# only which cell lines actually get plotted. Set to NULL to plot every
+# cell line present in the data.
+cell_lines_to_plot <- c("HOXC10","HOXC13","SOX2","HOXC10-13-10","HOXC13-10-13")
+
+# Restricts a vector/column of cell lines to `cell_lines_to_plot` above, if
+# set; returns everything unchanged when cell_lines_to_plot is NULL. Used
+# only in the plotting chunks below. Defined here (rather than alongside
+# the other helpers further down) so it's available to the very first
+# plotting chunk, plot-average-curves, which runs before that point.
+select_cell_lines <- function(all_cell_lines) {
+  if (is.null(cell_lines_to_plot)) return(all_cell_lines)
+  intersect(cell_lines_to_plot, all_cell_lines)
+}
+
+# Bleach time (s): used to mark the bleach event on plots and, if this is
+# left NA, to auto-detect the bleach frame for fitting (time of the
+# minimum ratio). The individual-curve csv files exported by the main
+# analysis script already have their time axis zeroed to the bleach event,
+# so 0 is the right default if you used that script's export. Set to NA to
+# auto-detect per curve instead, or to a fixed value if your files use a
+# different time convention.
+bleach_time <- 0
+
+# --- bootstrap settings ---
+# The bootstrap below now runs automatically for every cell line found in
+# the data (no need to name one here).
+
+# Which model to use for every bootstrap iteration - chosen manually
+# rather than automatically from `best_fits`, so it stays fixed even if
+# the AIC-best model changes as you tweak things upstream. Must be one of
+# "mono-exponential", "bi-exponential", "tri-exponential", and must be a
+# model that actually converged (in `fit_results`) for the cell
+# line/channel being bootstrapped.
+bootstrap_model <- "bi-exponential"   # <-- EDIT THIS if you want a different model
+
+n_bootstrap_iterations <- 1000
+
+# A fitted iteration is discarded if its recovery plateau (C + sum of all
+# A_i) exceeds this value. Data is normalized so the pre-bleach baseline
+# is ~1, so a plateau well above that usually signals a degenerate/
+# non-identifiable fit (e.g. a huge amplitude paired with a near-zero rate
+# constant for a poorly-resolved component) rather than a real recovery
+# curve - see the A vs 1/k diagnostic plots below for how to spot these.
+max_plateau_sum <- 1.5
+
+# for reproducibility of the random resampling
+set.seed(42)
+
+# --- colors used for the comparison curves and comparison violin plots ---
+cell_line_colors <- c(
+  "HOXC10"       = "#2888c2",
+  "HOXC10-13-10" = "#fd963a",
+  "HOXC13"       = "#b81d19",
+  "HOXC13-10-13" = "#8170b5",
+  "H2B"          = "#4D4C4E"
+)
+
+# The ribbons on the comparison FRAP curves are mean +/- 1 SEM, where the
+# SEM is calculated per frame across ALL individual ROIs from ALL
+# replicates (replicates are not used for the ribbon, and the line is the
+# mean of all ROIs, not the mean of replicate means).
+
+# Folder where all PDF figures are exported (created if missing)
+pdf_export_folder <- file.path(curve_folder, "pdf_figures")
+dir.create(pdf_export_folder, showWarnings = FALSE, recursive = TRUE)
+```
+
+## List and read individual-curve files
+
+```{r list-and-read}
+curve_files <- list.files(
+  curve_folder,
+  pattern    = "_individual_curves\\.csv$",
+  full.names = TRUE,
+  recursive  = recursive
+)
+
+curve_files
+
+individual_curves <- curve_files %>%
+  map_dfr(read_csv, show_col_types = FALSE) %>%
+  # replicate + roi_id uniquely identifies one region's curve across every
+  # replicate/file that got combined into curve_folder
+  mutate(curve_id = paste(replicate, roi_id, sep = " | "))
+
+head(individual_curves)
+```
+
+## Total number of individual curves
+
+```{r count-curves}
+curve_counts <- individual_curves %>%
+  distinct(cell_line, channel, curve_id) %>%
+  count(cell_line, channel, name = "n_curves")
+
+curve_counts
+
+total_curves_overall <- n_distinct(individual_curves$curve_id)
+cat("Total individual curves across all cell lines, channels, and replicates:",
+    total_curves_overall, "\n")
+```
+
+## Average curve across all individual curves, per cell line
+
+Every individual region, from every file and every replicate, belonging
+to a cell line is pooled together here - so a cell line with 40 curves
+contributes all 40 to the average, regardless of how many replicates or
+files they came from. Grouped by `cell_line`, `channel`, and `frame`.
+
+```{r average-curve}
+avg_curves <- individual_curves %>%
+  filter(!is.na(ratio_targeted_to_untargeted)) %>%
+  group_by(cell_line, channel, frame) %>%
+  summarize(
+    time       = first(time),
+    n_curves   = n(),
+    mean_ratio = mean(ratio_targeted_to_untargeted, na.rm = TRUE),
+    sd_ratio   = sd(ratio_targeted_to_untargeted, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+head(avg_curves)
+```
+
+```{r plot-average-curves, fig.width=9, fig.height=5}
+for (cl in select_cell_lines(unique(avg_curves$cell_line))) {
+
+  p <- avg_curves %>%
+    filter(cell_line == cl) %>%
+    ggplot(aes(x = time, y = mean_ratio)) +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_ribbon(
+      aes(ymin = mean_ratio - sd_ratio, ymax = mean_ratio + sd_ratio),
+      alpha = 0.2, fill = "#2C7FB8"
+    ) +
+    geom_line(color = "#2C7FB8", linewidth = 1) +
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(
+      title = paste("Cell line:", cl, "- average across all individual curves"),
+      subtitle = "Mean ± SD, pooled across all regions and replicates",
+      x = "Time (s)", y = "Targeted / Untargeted"
+    ) +
+    theme_minimal()
+
+  if (!is.na(bleach_time)) {
+    p <- p + geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50")
+  }
+
+  print(p)
+}
+```
+
+## Comparison plots of average curves (mean of all ROIs ± 1 SEM across all ROIs)
+
+Four comparison figures, each exported as a PDF (one per channel in
+`channels_to_model`) to `pdf_figures/average_curve_comparisons`:
+HOXC10 vs HOXC13, H2B alone, HOXC10 vs HOXC10-13-10, and HOXC13 vs
+HOXC13-10-13. The line is the mean over **all individual ROIs from all
+replicates**, and the ribbon is ± 1 standard error of the mean across those
+same ROIs (replicates are not used for the ribbon). These plots ignore
+`cell_lines_to_plot`.
+
+```{r plot-comparison-curves, fig.width=7, fig.height=5}
+curve_comparisons <- list(
+  "HOXC10_vs_HOXC13"       = c("HOXC10", "HOXC13"),
+  "H2B"                    = c("H2B"),
+  "HOXC10_vs_HOXC10-13-10" = c("HOXC10", "HOXC10-13-10"),
+  "HOXC13_vs_HOXC13-10-13" = c("HOXC13", "HOXC13-10-13")
+)
+
+roi_summary_curves <- individual_curves %>%
+  filter(!is.na(ratio_targeted_to_untargeted)) %>%
+  group_by(cell_line, channel, frame) %>%
+  summarize(
+    time       = first(time),
+    n_rois     = n(),
+    mean_ratio = mean(ratio_targeted_to_untargeted),
+    sd_ratio   = sd(ratio_targeted_to_untargeted),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    sem_ratio = sd_ratio / sqrt(n_rois),
+    ci_lower  = mean_ratio - sem_ratio,
+    ci_upper  = mean_ratio + sem_ratio
+  )
+
+curve_pdf_folder <- file.path(pdf_export_folder, "average_curve_comparisons")
+dir.create(curve_pdf_folder, showWarnings = FALSE, recursive = TRUE)
+
+for (ch in channels_to_model) {
+  for (nm in names(curve_comparisons)) {
+
+    lines_here <- curve_comparisons[[nm]]
+
+    labels_df <- curve_counts %>%
+      filter(channel == ch, cell_line %in% lines_here) %>%
+      mutate(label = paste0(cell_line, " (n = ", n_curves, " ROIs)"))
+
+    if (nrow(labels_df) == 0) {
+      message(sprintf("No data for %s, channel '%s' - skipping comparison plot.",
+                      paste(lines_here, collapse = " / "), ch))
+      next
+    }
+
+    d <- roi_summary_curves %>%
+      filter(channel == ch, cell_line %in% lines_here) %>%
+      left_join(labels_df %>% select(cell_line, label), by = "cell_line")
+
+    label_colors <- setNames(cell_line_colors[labels_df$cell_line], labels_df$label)
+
+    p <- ggplot(d, aes(x = time, y = mean_ratio, color = label, fill = label)) +
+      geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+      geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.25, color = NA) +
+      geom_line(linewidth = 1) +
+      scale_color_manual(values = label_colors) +
+      scale_fill_manual(values = label_colors) +
+      labs(
+        title = paste0(paste(lines_here, collapse = " vs. "), " - channel: ", ch),
+        subtitle = "Mean of all ROIs from all replicates; ribbon = ± 1 SEM across ROIs",
+        x = "Time (s)", y = "Targeted / Untargeted", color = NULL, fill = NULL
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+
+    if (!is.na(bleach_time)) {
+      p <- p + geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50")
+    }
+
+    print(p)
+
+    ggsave(
+      file.path(curve_pdf_folder, paste0(nm, "_", ch, ".pdf")),
+      p, width = 7, height = 5, device = "pdf"
+    )
+  }
+}
+```
+
+## Model the average recovery curves (mono-, bi-, tri-exponential)
+
+Fits each average cell-line/channel curve (restricted to
+`channels_to_model`) with one, two, or three exponential terms:
+
+$$y = C + A_1(1-e^{-k_1 t}) \;[+ A_2(1-e^{-k_2 t})] \;[+ A_3(1-e^{-k_3 t})]$$
+
+`C` is the offset (value at the bleach frame), each `A_i` is the amplitude
+of a recovery component, and each `k_i` its rate constant (time constant
+tau_i = 1/k_i). Fits use `minpack.lm::nlsLM()` with non-negative bounds on
+all parameters for physically sensible results.
+
+**Only the post-bleach recovery phase is fit.** A sum of terms like
+`1 - exp(-k*t)` is monotonically increasing, so it can only ever describe
+a curve that rises smoothly to a plateau. So for each curve, the code
+finds the bleach frame (from `bleach_time`, fixed or auto-detected), then
+fits only the data from that point onward, with time re-zeroed so `t = 0`
+at the bleach frame.
+
+**Each fit is wrapped in `tryCatch()`**, so if a particular cell
+line/channel/model combination fails to converge, it's recorded with an
+error message and the loop moves on. Fits are also skipped (with a
+message) if there aren't enough post-bleach data points to support the
+number of free parameters in that model.
+
+```{r fit-params}
+# Which exponential model orders to try for each curve (1 = mono, 2 = bi, 3 = tri)
+exp_orders_to_try <- c(1, 2, 3)
+
+# Minimum number of post-bleach data points required, over and above the
+# number of free parameters in the model, before a fit is even attempted.
+min_extra_points <- 3
+```
+
+```{r fit-helpers}
+# The bleach frame for a curve: the fixed `bleach_time` from the Parameters
+# section if set, otherwise auto-detected as the time of the minimum
+# mean_ratio (the bleach dip is normally the lowest point in the curve).
+get_bleach_time <- function(time, y) {
+  if (!is.na(bleach_time)) return(bleach_time)
+  time[which.min(y)]
+}
+
+# Builds the recovery formula for a given number of exponential terms, e.g.
+# for n_exp = 2: y ~ C + A1 * (1 - exp(-k1 * t)) + A2 * (1 - exp(-k2 * t))
+build_exp_formula <- function(n_exp) {
+  terms <- paste0("A", 1:n_exp, " * (1 - exp(-k", 1:n_exp, " * t))")
+  as.formula(paste("y ~ C +", paste(terms, collapse = " + ")))
+}
+
+# Rough starting values: offset at the first observed value, amplitude split
+# evenly across the terms, and rate constants spread across fast/medium/slow
+# relative to the time span of the curve.
+guess_start_params <- function(t, y, n_exp) {
+  y0      <- y[which.min(t)]
+  plateau <- mean(tail(y[order(t)], max(3, round(length(y) * 0.1))))
+  amp_total <- max(plateau - y0, 1e-3)
+
+  t_span <- diff(range(t))
+  if (!is.finite(t_span) || t_span <= 0) t_span <- 1
+
+  fracs <- list(`1` = 0.3, `2` = c(0.15, 0.5), `3` = c(0.1, 0.3, 0.7))[[as.character(n_exp)]]
+  ks    <- 1 / (t_span * fracs)
+
+  start <- c(C = max(y0, 0))
+  for (i in seq_len(n_exp)) {
+    start[paste0("A", i)] <- amp_total / n_exp
+    start[paste0("k", i)] <- ks[i]
+  }
+  start
+}
+
+# Fits one exponential model to one curve. Never throws an error itself -
+# always returns a list with $fit = NULL and a readable $error message if
+# the fit didn't work, so callers can just check `is.null(res$fit)`.
+fit_recovery_model <- function(t, y, n_exp) {
+  form  <- build_exp_formula(n_exp)
+  start <- guess_start_params(t, y, n_exp)
+  lower <- rep(0, length(start))
+  names(lower) <- names(start)
+  dat   <- data.frame(t = t, y = y)
+
+  tryCatch({
+    fit <- minpack.lm::nlsLM(
+      form, data = dat, start = as.list(start), lower = lower,
+      control = minpack.lm::nls.lm.control(maxiter = 500)
+    )
+    list(fit = fit, error = NA_character_)
+  }, error = function(e) {
+    list(fit = NULL, error = conditionMessage(e))
+  })
+}
+
+# Multi-exponential fits are only identified up to a permutation of the
+# (A_i, k_i) pairs - nlsLM() has no notion of "fast" vs "slow" component,
+# so which pair ends up labeled A1/k1 vs A2/k2 (etc.) is really just an
+# artifact of the starting values in guess_start_params(). This re-sorts a
+# fitted coefficient vector so k1 is always the fastest (largest) rate
+# constant, down to k_n the slowest, moving each A_i along with its paired
+# k_i so amplitude/rate pairs stay matched. C is left untouched. Applied
+# right after coef(fit) everywhere a model is fit, so "k1"/"A1" always mean
+# the same thing (fastest component) in fit_results and in every bootstrap
+# iteration.
+sort_components_by_rate <- function(co, n_exp) {
+  if (n_exp <= 1) return(co)
+
+  k_names <- paste0("k", seq_len(n_exp))
+  ord     <- order(co[k_names], decreasing = TRUE)
+
+  sorted <- co
+  for (i in seq_len(n_exp)) {
+    sorted[paste0("A", i)] <- co[paste0("A", ord[i])]
+    sorted[paste0("k", i)] <- co[paste0("k", ord[i])]
+  }
+  sorted
+}
+```
+
+```{r run-fits}
+fit_data <- avg_curves %>% filter(channel %in% channels_to_model)
+
+fit_combinations <- fit_data %>% distinct(cell_line, channel)
+
+model_labels <- c(`1` = "mono-exponential", `2` = "bi-exponential", `3` = "tri-exponential")
+
+fit_results_list     <- list()
+fit_predictions_list <- list()
+
+for (i in seq_len(nrow(fit_combinations))) {
+  cl <- fit_combinations$cell_line[i]
+  ch <- fit_combinations$channel[i]
+
+  curve_full <- fit_data %>%
+    filter(cell_line == cl, channel == ch) %>%
+    arrange(time)
+
+  t0 <- get_bleach_time(curve_full$time, curve_full$mean_ratio)
+
+  curve_data <- curve_full %>%
+    filter(time >= t0) %>%
+    mutate(t_fit = time - t0)
+
+  for (n_exp in exp_orders_to_try) {
+
+    model_label <- unname(model_labels[as.character(n_exp)])
+    n_params    <- 2 * n_exp + 1
+    min_points  <- n_params + min_extra_points
+
+    if (nrow(curve_data) < min_points) {
+      err_msg <- sprintf(
+        "only %d post-bleach point(s) available, need at least %d for a %d-parameter model",
+        nrow(curve_data), min_points, n_params
+      )
+      message(sprintf(
+        "Fit skipped for cell line '%s', channel '%s', %s: %s",
+        cl, ch, model_label, err_msg
+      ))
+
+      fit_results_list[[length(fit_results_list) + 1]] <- tibble(
+        cell_line = cl, channel = ch, model = model_label, n_exp = n_exp,
+        converged = FALSE, error = err_msg,
+        bleach_time_used = t0, n_points_fit = nrow(curve_data),
+        AIC = NA_real_, BIC = NA_real_, RSE = NA_real_
+      )
+      next
+    }
+
+    res <- fit_recovery_model(curve_data$t_fit, curve_data$mean_ratio, n_exp)
+
+    if (is.null(res$fit)) {
+      message(sprintf(
+        "Fit failed for cell line '%s', channel '%s', %s: %s",
+        cl, ch, model_label, res$error
+      ))
+
+      fit_results_list[[length(fit_results_list) + 1]] <- tibble(
+        cell_line = cl, channel = ch, model = model_label, n_exp = n_exp,
+        converged = FALSE, error = res$error,
+        bleach_time_used = t0, n_points_fit = nrow(curve_data),
+        AIC = NA_real_, BIC = NA_real_, RSE = NA_real_
+      )
+      next
+    }
+
+    fit <- res$fit
+    co  <- coef(fit)
+    co  <- sort_components_by_rate(co, n_exp)
+
+    k_vals   <- co[grepl("^k", names(co))]
+    tau_vals <- 1 / k_vals
+    names(tau_vals) <- paste0("tau_", seq_along(tau_vals))
+
+    params_row <- as_tibble(as.list(co)) %>%
+      bind_cols(as_tibble(as.list(tau_vals)))
+
+    fit_results_list[[length(fit_results_list) + 1]] <- tibble(
+      cell_line = cl, channel = ch, model = model_label, n_exp = n_exp,
+      converged = TRUE, error = NA_character_,
+      bleach_time_used = t0, n_points_fit = nrow(curve_data),
+      AIC = AIC(fit), BIC = BIC(fit), RSE = summary(fit)$sigma
+    ) %>%
+      bind_cols(params_row)
+
+    fitted_vals <- predict(fit)
+
+    fit_predictions_list[[length(fit_predictions_list) + 1]] <- tibble(
+      cell_line = cl, channel = ch, model = model_label, n_exp = n_exp,
+      time = curve_data$time, observed = curve_data$mean_ratio,
+      fitted = fitted_vals, residual = curve_data$mean_ratio - fitted_vals
+    )
+  }
+}
+
+fit_results     <- bind_rows(fit_results_list)
+fit_predictions <- bind_rows(fit_predictions_list)
+
+# Mobile fraction = total recovered amplitude / (1 - offset), assuming the
+# pre-bleach baseline is normalized to 1. Immobile fraction is the
+# complement. Both are only computed for converged fits.
+fit_results <- fit_results %>%
+  rowwise() %>%
+  mutate(
+    mobile_fraction = if (converged) {
+      sum(c_across(matches("^A[0-9]+$")), na.rm = TRUE) / (1 - C)
+    } else {
+      NA_real_
+    },
+    immobile_fraction = if (converged) 1 - mobile_fraction else NA_real_,
+    # unrecovered_raw: 1 - C - sum(A_i) - the raw, un-normalized gap
+    # between the pre-bleach baseline and the fitted plateau ("what
+    # percentage does not recover", with no division at all). An
+    # alternative to immobile_fraction for plots where you want to read
+    # the un-recovered amount directly, without normalizing for how deep
+    # the bleach itself went.
+    unrecovered_raw = if (converged) {
+      1 - C - sum(c_across(matches("^A[0-9]+$")), na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup() %>%
+  # Each component's own amplitude, and unrecovered_raw, expressed as a
+  # share of the recoverable range (divided by 1 - C). frac_unrecovered is
+  # mathematically identical to immobile_fraction; it's computed
+  # separately here so it sits alongside frac_A1/frac_A2/... as one
+  # self-contained "divided by 1 - C" group of columns. across() only
+  # touches whichever A_i columns actually exist, so this works for
+  # mono-, bi-, or tri-exponential fits without any special-casing.
+  mutate(
+    across(matches("^A[0-9]+$"), ~ .x / (1 - C), .names = "frac_{.col}"),
+    frac_unrecovered = unrecovered_raw / (1 - C)
+  )
+
+fit_results
+```
+
+## Best-fitting model per curve
+
+Among the models that converged, picks the one with the lowest AIC for
+each cell line/channel. This is the model order used below, both for
+display and as the model fit during the bootstrap.
+
+```{r best-fits-table}
+best_fits <- fit_results %>%
+  filter(converged) %>%
+  group_by(cell_line, channel) %>%
+  slice_min(AIC, n = 1) %>%
+  ungroup()
+
+best_fits
+```
+
+## Plot: average curves with fitted recovery curves overlaid
+
+One plot per cell line per model order (faceted by channel).
+
+```{r plot-fits, fig.width=9, fig.height=5}
+for (model_lbl in unname(model_labels)) {
+
+  preds_model <- fit_predictions %>% filter(model == model_lbl)
+
+  for (cl in select_cell_lines(unique(fit_data$cell_line))) {
+
+    obs   <- fit_data %>% filter(cell_line == cl)
+    preds <- preds_model %>% filter(cell_line == cl)
+    bleach_ref <- fit_results %>%
+      filter(cell_line == cl, model == model_lbl) %>%
+      distinct(channel, bleach_time_used)
+
+    p <- ggplot() +
+      geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+      geom_ribbon(
+        data = obs,
+        aes(x = time, ymin = mean_ratio - sd_ratio, ymax = mean_ratio + sd_ratio),
+        alpha = 0.15, fill = "grey50"
+      ) +
+      geom_point(data = obs, aes(x = time, y = mean_ratio), color = "grey30", size = 0.8, alpha = 0.6)
+
+    if (nrow(bleach_ref) > 0) {
+      p <- p + geom_vline(
+        data = bleach_ref, aes(xintercept = bleach_time_used),
+        linetype = "dashed", color = "grey50"
+      )
+    }
+
+    if (nrow(preds) > 0) {
+      p <- p + geom_line(data = preds, aes(x = time, y = fitted), color = "#D95F02", linewidth = 1)
+    }
+
+    p <- p +
+      facet_wrap(~ channel, scales = "free_y") +
+      labs(
+        title = paste("Cell line:", cl, "-", model_lbl, "fit"),
+        x = "Time (s)", y = "Targeted / Untargeted"
+      ) +
+      theme_minimal()
+
+    print(p)
+  }
+}
+```
+
+## Plot: fit residuals
+
+```{r plot-residuals, fig.width=9, fig.height=5}
+for (model_lbl in unname(model_labels)) {
+
+  preds_model <- fit_predictions %>% filter(model == model_lbl)
+
+  for (cl in select_cell_lines(unique(fit_data$cell_line))) {
+
+    preds <- preds_model %>% filter(cell_line == cl)
+
+    if (nrow(preds) == 0) next
+
+    p <- ggplot(preds, aes(x = time, y = residual)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_point(color = "#7570B3", size = 1.2, alpha = 0.7) +
+      geom_line(color = "#7570B3", alpha = 0.4) +
+      facet_wrap(~ channel, scales = "free_y") +
+      labs(
+        title = paste("Cell line:", cl, "-", model_lbl, "residuals"),
+        x = "Time (s)", y = "Observed - fitted"
+      ) +
+      theme_minimal()
+
+    print(p)
+  }
+}
+```
+
+## Fit parameter summary table
+
+```{r fits-table}
+fit_results %>%
+  filter(converged) %>%
+  select(cell_line, channel, model, AIC, BIC, RSE, mobile_fraction, immobile_fraction,
+         bleach_time_used, n_points_fit, everything(),
+         -n_exp, -converged, -error) %>%
+  arrange(cell_line, channel, AIC) %>%
+  knitr::kable(digits = 4)
+```
+
+```{r failed-fits-table}
+failed <- fit_results %>% filter(!converged)
+
+if (nrow(failed) > 0) {
+  failed %>%
+    select(cell_line, channel, model, bleach_time_used, n_points_fit, error) %>%
+    knitr::kable()
+} else {
+  cat("All fits converged.")
+}
+```
+
+## Alternative: per-replicate fits
+
+As an alternative to the resampling-based bootstrap below, this fits each
+**replicate's own average curve independently**: every individual curve
+belonging to one replicate is averaged into that replicate's average
+curve, and that curve is fit on its own using `bootstrap_model` (the same
+model used for the bootstrap, so the two approaches are directly
+comparable). Across the resulting per-replicate fits, each parameter's
+**mean and SD across replicates** is reported - an estimate of
+variability driven by real replicate-to-replicate differences, rather
+than by resampling the same pooled pool of curves. As with `fit_results`
+above, rate constants are reported as `tau_i = 1/k_i`, not as a
+half-time.
+
+A given cell line/channel is only fit if `bootstrap_model` actually
+converged on the pooled average curve there (same requirement as the
+bootstrap uses to pick `n_exp`); within that, an individual replicate is
+skipped (and listed in the failed-fits table below) if it doesn't have
+enough post-bleach points or its own fit doesn't converge.
+
+```{r replicate-average-curves}
+replicate_avg_curves <- individual_curves %>%
+  filter(!is.na(ratio_targeted_to_untargeted)) %>%
+  group_by(cell_line, channel, replicate, frame) %>%
+  summarize(
+    time       = first(time),
+    n_curves   = n(),
+    mean_ratio = mean(ratio_targeted_to_untargeted, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+head(replicate_avg_curves)
+```
+
+```{r replicate-fits}
+replicate_fit_results_list     <- list()
+replicate_fit_predictions_list <- list()
+
+for (cl in unique(replicate_avg_curves$cell_line)) {
+
+  channels_here <- intersect(
+    channels_to_model,
+    unique(replicate_avg_curves$channel[replicate_avg_curves$cell_line == cl])
+  )
+
+  for (ch in channels_here) {
+
+    # use the same model order chosen for the bootstrap, and require that
+    # it actually converged on the pooled average curve for this cell
+    # line/channel - same requirement the bootstrap uses above
+    chosen_row <- fit_results %>%
+      filter(cell_line == cl, channel == ch, model == bootstrap_model, converged)
+
+    if (nrow(chosen_row) == 0) {
+      message(sprintf(
+        "No converged '%s' fit found for cell line '%s', channel '%s' - skipping per-replicate fits.",
+        bootstrap_model, cl, ch
+      ))
+      next
+    }
+
+    n_exp <- chosen_row$n_exp[1]
+
+    replicates_here <- replicate_avg_curves %>%
+      filter(cell_line == cl, channel == ch) %>%
+      pull(replicate) %>%
+      unique()
+
+    for (rep in replicates_here) {
+
+      curve_full <- replicate_avg_curves %>%
+        filter(cell_line == cl, channel == ch, replicate == rep) %>%
+        arrange(time)
+
+      t0 <- get_bleach_time(curve_full$time, curve_full$mean_ratio)
+
+      curve_data <- curve_full %>%
+        filter(time >= t0) %>%
+        mutate(t_fit = time - t0)
+
+      n_params   <- 2 * n_exp + 1
+      min_points <- n_params + min_extra_points
+
+      if (nrow(curve_data) < min_points) {
+        replicate_fit_results_list[[length(replicate_fit_results_list) + 1]] <- tibble(
+          cell_line = cl, channel = ch, replicate = rep, model = bootstrap_model, n_exp = n_exp,
+          converged = FALSE, error = "too few post-bleach points",
+          bleach_time_used = t0, n_points_fit = nrow(curve_data)
+        )
+        next
+      }
+
+      res <- fit_recovery_model(curve_data$t_fit, curve_data$mean_ratio, n_exp)
+
+      if (is.null(res$fit)) {
+        replicate_fit_results_list[[length(replicate_fit_results_list) + 1]] <- tibble(
+          cell_line = cl, channel = ch, replicate = rep, model = bootstrap_model, n_exp = n_exp,
+          converged = FALSE, error = res$error,
+          bleach_time_used = t0, n_points_fit = nrow(curve_data)
+        )
+        next
+      }
+
+      fit <- res$fit
+      co  <- coef(fit)
+      co  <- sort_components_by_rate(co, n_exp)
+
+      k_vals   <- co[grepl("^k", names(co))]
+      tau_vals <- 1 / k_vals
+      names(tau_vals) <- paste0("tau_", seq_along(tau_vals))
+
+      mobile_fraction   <- unname(sum(co[grepl("^A", names(co))]) / (1 - co["C"]))
+      immobile_fraction <- 1 - mobile_fraction
+
+      params_row <- as_tibble(as.list(co)) %>%
+        bind_cols(as_tibble(as.list(tau_vals)))
+
+      replicate_fit_results_list[[length(replicate_fit_results_list) + 1]] <- tibble(
+        cell_line = cl, channel = ch, replicate = rep, model = bootstrap_model, n_exp = n_exp,
+        converged = TRUE, error = NA_character_,
+        bleach_time_used = t0, n_points_fit = nrow(curve_data),
+        mobile_fraction = mobile_fraction, immobile_fraction = immobile_fraction
+      ) %>%
+        bind_cols(params_row)
+
+      fitted_vals <- predict(fit)
+
+      replicate_fit_predictions_list[[length(replicate_fit_predictions_list) + 1]] <- tibble(
+        cell_line = cl, channel = ch, replicate = rep, model = bootstrap_model, n_exp = n_exp,
+        time = curve_data$time, observed = curve_data$mean_ratio,
+        fitted = fitted_vals, residual = curve_data$mean_ratio - fitted_vals
+      )
+    }
+  }
+}
+
+replicate_fit_results     <- bind_rows(replicate_fit_results_list)
+replicate_fit_predictions <- bind_rows(replicate_fit_predictions_list)
+
+# Same unrecovered_raw / frac_A* / frac_unrecovered columns as fit_results
+# above (see the comments there) - added once, vectorized, on the full
+# bound table rather than inside the loop.
+replicate_fit_results <- replicate_fit_results %>%
+  rowwise() %>%
+  mutate(
+    unrecovered_raw = if (converged) {
+      1 - C - sum(c_across(matches("^A[0-9]+$")), na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup() %>%
+  mutate(
+    across(matches("^A[0-9]+$"), ~ .x / (1 - C), .names = "frac_{.col}"),
+    frac_unrecovered = unrecovered_raw / (1 - C)
+  )
+
+replicate_fit_results
+```
+
+```{r replicate-fits-failed}
+replicate_failed <- replicate_fit_results %>% filter(!converged)
+
+if (nrow(replicate_failed) > 0) {
+  replicate_failed %>%
+    select(cell_line, channel, replicate, model, bleach_time_used, n_points_fit, error) %>%
+    knitr::kable()
+} else {
+  cat("All per-replicate fits converged.")
+}
+```
+
+### Plot: each replicate's average curve with its own fit overlaid
+
+Before summarizing across replicates, this shows every replicate's fit
+individually - one panel per channel/replicate combination - so you can
+see directly how much the fitted curve (and not just the extracted
+parameters) actually varies from replicate to replicate.
+
+```{r plot-replicate-fits, fig.width=10, fig.height=7}
+for (cl in select_cell_lines(unique(replicate_avg_curves$cell_line))) {
+
+  obs   <- replicate_avg_curves %>% filter(cell_line == cl, channel %in% channels_to_model)
+  preds <- replicate_fit_predictions %>% filter(cell_line == cl)
+
+  if (nrow(preds) == 0) next
+
+  bleach_ref <- replicate_fit_results %>%
+    filter(cell_line == cl, converged) %>%
+    distinct(channel, replicate, bleach_time_used)
+
+  p <- ggplot() +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_point(data = obs, aes(x = time, y = mean_ratio), color = "grey30", size = 0.8, alpha = 0.6)
+
+  if (nrow(bleach_ref) > 0) {
+    p <- p + geom_vline(
+      data = bleach_ref, aes(xintercept = bleach_time_used),
+      linetype = "dashed", color = "grey50"
+    )
+  }
+
+  p <- p +
+    geom_line(data = preds, aes(x = time, y = fitted), color = "#D95F02", linewidth = 1) +
+    facet_wrap(~ channel + replicate, scales = "free_y") +
+    labs(
+      title = paste0("Cell line: ", cl, " - per-replicate ", bootstrap_model, " fits"),
+      x = "Time (s)", y = "Targeted / Untargeted"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+### Per-replicate fit parameter summary (mean ± SD across replicates)
+
+```{r replicate-fits-summary}
+replicate_param_cols <- replicate_fit_results %>%
+  select(matches("^C$"), matches("^A[0-9]+$"), matches("^k[0-9]+$"),
+         matches("^tau_[0-9]+$"), unrecovered_raw) %>%
+  names()
+
+replicate_counts <- replicate_avg_curves %>%
+  distinct(cell_line, channel, replicate) %>%
+  count(cell_line, channel, name = "n_replicates_total")
+
+replicate_fit_summary <- replicate_fit_results %>%
+  filter(converged) %>%
+  group_by(cell_line, channel) %>%
+  summarize(
+    n_replicates_converged = n(),
+    across(
+      all_of(replicate_param_cols),
+      list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  left_join(replicate_counts, by = c("cell_line", "channel")) %>%
+  relocate(n_replicates_total, .after = channel)
+
+replicate_fit_summary %>% knitr::kable(digits = 4)
+```
+
+```{r plot-replicate-fits-summary, fig.width=12, fig.height=10}
+replicate_fit_summary_long <- replicate_fit_summary %>%
+  select(cell_line, channel, ends_with("_mean"), ends_with("_sd")) %>%
+  pivot_longer(
+    cols = -c(cell_line, channel),
+    names_to = c("parameter", ".value"),
+    names_pattern = "^(.*)_(mean|sd)$"
+  )
+
+# one row per replicate per parameter, so each replicate's own fitted value
+# can be overlaid as a dot on top of the mean ± SD bar
+replicate_fit_points <- replicate_fit_results %>%
+  filter(converged) %>%
+  select(cell_line, channel, replicate, all_of(replicate_param_cols)) %>%
+  pivot_longer(cols = all_of(replicate_param_cols), names_to = "parameter", values_to = "value")
+
+# one fixed point shape per replicate (shared across all cell lines/
+# channels/parameters below, so e.g. "replicate 1" is always the same
+# shape everywhere), rather than color, since color is already used for
+# the bars.
+replicate_levels <- sort(unique(replicate_fit_points$replicate))
+replicate_shape_values <- setNames(rep(0:25, length.out = length(replicate_levels)), replicate_levels)
+
+for (ch in unique(replicate_fit_summary_long$channel)) {
+
+  stat   <- replicate_fit_summary_long %>% filter(channel == ch, cell_line %in% select_cell_lines(unique(replicate_fit_summary_long$cell_line)))
+  points <- replicate_fit_points %>% filter(channel == ch, cell_line %in% select_cell_lines(unique(replicate_fit_points$cell_line)))
+
+  p <- ggplot(stat, aes(x = cell_line, y = mean, fill = cell_line)) +
+    geom_col(alpha = 0.6, width = 0.7) +
+    geom_errorbar(
+      aes(ymin = mean - sd, ymax = mean + sd),
+      width = 0.25, color = "#D95F02", linewidth = 0.8
+    ) +
+    geom_jitter(
+      data = points, aes(x = cell_line, y = value, shape = replicate),
+      inherit.aes = FALSE, width = 0.12, height = 0,
+      size = 2, alpha = 0.8, color = "black"
+    ) +
+    scale_shape_manual(values = replicate_shape_values) +
+    facet_wrap(~ parameter, scales = "free", ncol = 4) +
+    labs(
+      title = paste0("Channel: ", ch, " - per-replicate ", bootstrap_model, " fit: mean ± SD across replicates"),
+      subtitle = "Bar = mean across replicate average-curve fits; error bar = ± 1 SD; dot shape = replicate",
+      x = "Cell line", y = "Value", shape = "Replicate"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    guides(fill = "none")
+
+  print(p)
+}
+```
+
+### Per-replicate: A_i and unrecovered fraction, each divided by (1 - C)
+
+A second view of the same per-replicate fits, decomposing the recoverable
+range (`1 - C`) into each component's own share (`A_i / (1 - C)`) plus the
+share that never recovered (`frac_unrecovered`, i.e. `unrecovered_raw /
+(1 - C)`) - together these sum to 1 for a given replicate. Kept separate
+from the panel above so it isn't mixed in with `C`, `k_i`, and `tau_i` on
+very different scales. Works for mono-, bi-, or tri-exponential fits
+without changes, since it only plots whichever `frac_A*` columns exist.
+
+```{r plot-replicate-fits-fractions, fig.width=12, fig.height=6}
+replicate_fraction_cols <- replicate_fit_results %>%
+  select(matches("^frac_A[0-9]+$"), frac_unrecovered) %>%
+  names()
+
+replicate_fraction_summary_long <- replicate_fit_results %>%
+  filter(converged) %>%
+  group_by(cell_line, channel) %>%
+  summarize(
+    across(
+      all_of(replicate_fraction_cols),
+      list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  select(cell_line, channel, ends_with("_mean"), ends_with("_sd")) %>%
+  pivot_longer(
+    cols = -c(cell_line, channel),
+    names_to = c("parameter", ".value"),
+    names_pattern = "^(.*)_(mean|sd)$"
+  )
+
+replicate_fraction_points <- replicate_fit_results %>%
+  filter(converged) %>%
+  select(cell_line, channel, replicate, all_of(replicate_fraction_cols)) %>%
+  pivot_longer(cols = all_of(replicate_fraction_cols), names_to = "parameter", values_to = "value")
+
+for (ch in unique(replicate_fraction_summary_long$channel)) {
+
+  stat   <- replicate_fraction_summary_long %>% filter(channel == ch, cell_line %in% select_cell_lines(unique(replicate_fraction_summary_long$cell_line)))
+  points <- replicate_fraction_points %>% filter(channel == ch, cell_line %in% select_cell_lines(unique(replicate_fraction_points$cell_line)))
+
+  p <- ggplot(stat, aes(x = cell_line, y = mean, fill = cell_line)) +
+    geom_col(alpha = 0.6, width = 0.7) +
+    geom_errorbar(
+      aes(ymin = mean - sd, ymax = mean + sd),
+      width = 0.25, color = "#D95F02", linewidth = 0.8
+    ) +
+    geom_jitter(
+      data = points, aes(x = cell_line, y = value, shape = replicate),
+      inherit.aes = FALSE, width = 0.12, height = 0,
+      size = 2, alpha = 0.8, color = "black"
+    ) +
+    scale_shape_manual(values = replicate_shape_values) +
+    facet_wrap(~ parameter, scales = "free", ncol = 4) +
+    labs(
+      title = paste0("Channel: ", ch, " - A_i and unrecovered fraction (each / (1 - C)), per replicate"),
+      subtitle = "Bar = mean across replicate fits; error bar = ± 1 SD; dot shape = replicate",
+      x = "Cell line", y = "Value / (1 - C)", shape = "Replicate"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    guides(fill = "none")
+
+  print(p)
+}
+```
+
+## Bootstrap resampling of individual curves (all cell lines)
+
+For every cell line found in the data, and separately for each channel in
+`channels_to_model`, this repeats the following `n_bootstrap_iterations`
+(1,000) times:
+
+1. Let `x` = the number of individual curves actually available for this
+   cell line/channel (from `curve_counts` above).
+2. Randomly draw `x` curves **with replacement** from that pool - so the
+   same individual curve can be picked more than once in a given
+   iteration, and left out entirely in another.
+3. Average the drawn curves (duplicates included, so a curve picked twice
+   counts twice toward the average) into one resampled recovery curve.
+4. Re-fit that resampled curve using `bootstrap_model` (set manually in
+   the Parameters section, default `"bi-exponential"` - independent of
+   whatever `best_fits` picked by AIC above). The chosen model must have
+   actually converged on the full average curve (i.e. have a row in
+   `fit_results`) for a given cell line/channel, or that channel is
+   skipped with a message. An iteration whose fit converges but whose
+   plateau (`C + sum(A_i)`) exceeds `max_plateau_sum`, or in which any rate
+   constant `k_i` lands exactly on its lower bound of 0 (making
+   `tau_i = 1/k_i` infinite), is discarded rather than saved (see
+   "Bootstrap discard summary" below).
+
+After 1,000 iterations, the saved parameters are summarized as a mean and
+SD per parameter, which reflects how much the fit would plausibly vary if
+you'd happened to image a different random subset of regions.
+
+Curves are drawn separately per cell line and per channel, since each
+cell line/channel combination has its own curve pool and its own average
+curve/fit.
+
+```{r bootstrap-helper}
+# Builds one resampled "average" curve from an already-drawn vector of
+# curve_ids (which may contain repeats, since draws are made with
+# replacement): each draw's curve contributes its full time series again,
+# and the ratio is averaged across all draws at each frame.
+build_resampled_curve <- function(curve_frame_data, sampled_ids) {
+  sample_draws <- tibble(draw = seq_along(sampled_ids), curve_id = sampled_ids)
+
+  sample_draws %>%
+    left_join(curve_frame_data, by = "curve_id", relationship = "many-to-many") %>%
+    group_by(frame) %>%
+    summarize(
+      time       = first(time),
+      mean_ratio = mean(ratio_targeted_to_untargeted, na.rm = TRUE),
+      .groups    = "drop"
+    )
+}
+```
+
+```{r bootstrap-run}
+bootstrap_results_list <- list()
+
+for (cl in unique(curve_counts$cell_line)) {
+
+  bootstrap_pool <- individual_curves %>%
+    filter(cell_line == cl,
+           channel %in% channels_to_model,
+           !is.na(ratio_targeted_to_untargeted))
+
+  for (ch in intersect(channels_to_model, unique(bootstrap_pool$channel))) {
+
+    curve_frame_data <- bootstrap_pool %>%
+      filter(channel == ch) %>%
+      select(curve_id, frame, time, ratio_targeted_to_untargeted)
+
+    curve_pool <- unique(curve_frame_data$curve_id)
+    n_draw     <- length(curve_pool)
+
+    # look up the manually chosen model, requiring that it actually
+    # converged on the full average curve for this cell line/channel
+    chosen_row <- fit_results %>%
+      filter(cell_line == cl, channel == ch,
+             model == bootstrap_model, converged)
+
+    if (nrow(chosen_row) == 0 || n_draw == 0) {
+      message(sprintf(
+        "No converged '%s' fit (or no curves) found for cell line '%s', channel '%s' - skipping bootstrap.",
+        bootstrap_model, cl, ch
+      ))
+      next
+    }
+
+    n_exp       <- chosen_row$n_exp[1]
+    model_label <- bootstrap_model
+
+    message(sprintf(
+      "Bootstrapping cell line '%s', channel '%s': %d curves available, drawing %d per iteration (with replacement), %s model, %d iterations...",
+      cl, ch, n_draw, n_draw, model_label, n_bootstrap_iterations
+    ))
+
+    for (iter in seq_len(n_bootstrap_iterations)) {
+
+      # draw first, so we can track how many *distinct* curves ended up in
+      # this iteration's sample (repeats are expected, since draws are with
+      # replacement)
+      sampled_ids     <- sample(curve_pool, size = n_draw, replace = TRUE)
+      n_unique_curves <- length(unique(sampled_ids))
+
+      resampled_curve <- build_resampled_curve(curve_frame_data, sampled_ids)
+
+      t0 <- get_bleach_time(resampled_curve$time, resampled_curve$mean_ratio)
+
+      fit_data_iter <- resampled_curve %>%
+        filter(time >= t0) %>%
+        mutate(t_fit = time - t0)
+
+      n_params   <- 2 * n_exp + 1
+      min_points <- n_params + min_extra_points
+
+      if (nrow(fit_data_iter) < min_points) {
+        bootstrap_results_list[[length(bootstrap_results_list) + 1]] <- tibble(
+          cell_line = cl, channel = ch, iteration = iter,
+          n_curves_drawn = n_draw, n_unique_curves = n_unique_curves,
+          converged = FALSE, error = "too few post-bleach points",
+          discard_reason = "fit_failed"
+        )
+        next
+      }
+
+      res <- fit_recovery_model(fit_data_iter$t_fit, fit_data_iter$mean_ratio, n_exp)
+
+      if (is.null(res$fit)) {
+        bootstrap_results_list[[length(bootstrap_results_list) + 1]] <- tibble(
+          cell_line = cl, channel = ch, iteration = iter,
+          n_curves_drawn = n_draw, n_unique_curves = n_unique_curves,
+          converged = FALSE, error = res$error,
+          discard_reason = "fit_failed"
+        )
+        next
+      }
+
+      fit <- res$fit
+      co  <- coef(fit)
+      co  <- sort_components_by_rate(co, n_exp)
+
+      # discard iterations whose fitted plateau (C + sum of all A_i) is
+      # implausibly high - see max_plateau_sum in the Parameters section
+      plateau_sum <- unname(co["C"] + sum(co[grepl("^A", names(co))]))
+
+      if (plateau_sum > max_plateau_sum) {
+        bootstrap_results_list[[length(bootstrap_results_list) + 1]] <- tibble(
+          cell_line = cl, channel = ch, iteration = iter,
+          n_curves_drawn = n_draw, n_unique_curves = n_unique_curves,
+          converged = FALSE,
+          error = sprintf("discarded: C + sum(A_i) = %.3f exceeds max_plateau_sum (%.2f)",
+                           plateau_sum, max_plateau_sum),
+          discard_reason = "plateau_too_high"
+        )
+        next
+      }
+
+      # discard iterations where any rate constant landed exactly on its
+      # lower bound (0) in fit_recovery_model(). k_i = 0 is itself a
+      # legitimate fit result (that component doesn't move on an
+      # observable timescale in this iteration's resampled curve), but
+      # tau_i = 1/k_i is then Inf, and a single Inf poisons every
+      # downstream mean/SD - and, if this happens often enough for a given
+      # cell line/channel, even the median - computed across iterations
+      # for that tau_i column. Since k_i can't go below 0 (it's
+      # box-constrained there), k_i <= 0 here can only mean it sits
+      # exactly on the boundary, not floating-point noise. The whole
+      # iteration is discarded (not just tau_i) - a component that
+      # vanished this way makes every parameter's estimate for this
+      # iteration suspect, not only the rate that hit the wall.
+      k_vals <- co[grepl("^k", names(co))]
+
+      if (any(k_vals <= 0)) {
+        bootstrap_results_list[[length(bootstrap_results_list) + 1]] <- tibble(
+          cell_line = cl, channel = ch, iteration = iter,
+          n_curves_drawn = n_draw, n_unique_curves = n_unique_curves,
+          converged = FALSE,
+          error = sprintf("discarded: rate constant(s) %s landed on the lower bound (0) - tau undefined",
+                           paste(names(k_vals)[k_vals <= 0], collapse = ", ")),
+          discard_reason = "rate_at_lower_bound"
+        )
+        next
+      }
+
+      tau_vals <- 1 / k_vals
+      names(tau_vals) <- paste0("tau_", seq_along(tau_vals))
+
+      mobile_fraction   <- unname(sum(co[grepl("^A", names(co))]) / (1 - co["C"]))
+      immobile_fraction <- 1 - mobile_fraction
+
+      params_row <- as_tibble(as.list(co)) %>%
+        bind_cols(as_tibble(as.list(tau_vals)))
+
+      bootstrap_results_list[[length(bootstrap_results_list) + 1]] <- tibble(
+        cell_line = cl, channel = ch, iteration = iter,
+        n_curves_drawn = n_draw, n_unique_curves = n_unique_curves,
+        converged = TRUE, error = NA_character_, discard_reason = NA_character_,
+        mobile_fraction = mobile_fraction, immobile_fraction = immobile_fraction
+      ) %>%
+        bind_cols(params_row)
+    }
+  }
+}
+
+bootstrap_params <- bind_rows(bootstrap_results_list)
+
+# Same unrecovered_raw / frac_A* / frac_unrecovered columns as fit_results
+# and replicate_fit_results above (see the comments there) - added once,
+# vectorized, on the full bound table rather than inside the loop (much
+# cheaper than computing it per-iteration for n_bootstrap_iterations rows).
+bootstrap_params <- bootstrap_params %>%
+  rowwise() %>%
+  mutate(
+    unrecovered_raw = if (converged) {
+      1 - C - sum(c_across(matches("^A[0-9]+$")), na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup() %>%
+  mutate(
+    across(matches("^A[0-9]+$"), ~ .x / (1 - C), .names = "frac_{.col}"),
+    frac_unrecovered = unrecovered_raw / (1 - C)
+  )
+
+head(bootstrap_params)
+```
+
+### Bootstrap discard summary
+
+Every iteration lands in one of four buckets: **kept** (converged, its
+plateau is within `max_plateau_sum`, and every rate constant is strictly
+above its lower bound), **fit failed** (too few post-bleach points, or
+`nlsLM()` itself didn't converge), **discarded - plateau too high**
+(`nlsLM()` converged, but `C + sum(A_i)` exceeded `max_plateau_sum` and was
+thrown out as a degenerate fit), or **discarded - rate at lower bound**
+(`nlsLM()` converged, but at least one `k_i` landed exactly on its lower
+bound of 0, making `tau_i = 1/k_i` infinite and unusable in any downstream
+mean/SD/median). This reports what percentage of each cell line/channel's
+iterations fell into each bucket.
+
+```{r bootstrap-discard-summary}
+bootstrap_discard_summary <- bootstrap_params %>%
+  group_by(cell_line, channel) %>%
+  summarize(
+    n_total               = n(),
+    n_kept                = sum(converged),
+    n_fit_failed          = sum(discard_reason == "fit_failed", na.rm = TRUE),
+    n_high_plateau        = sum(discard_reason == "plateau_too_high", na.rm = TRUE),
+    n_rate_at_boundary    = sum(discard_reason == "rate_at_lower_bound", na.rm = TRUE),
+    pct_kept              = 100 * n_kept / n_total,
+    pct_fit_failed        = 100 * n_fit_failed / n_total,
+    pct_high_plateau      = 100 * n_high_plateau / n_total,
+    pct_rate_at_boundary  = 100 * n_rate_at_boundary / n_total,
+    pct_discarded_total   = 100 * (n_fit_failed + n_high_plateau + n_rate_at_boundary) / n_total,
+    .groups = "drop"
+  )
+
+bootstrap_discard_summary %>% knitr::kable(digits = 1)
+```
+
+### Bootstrap parameter summary (median ± SD across 1,000 iterations)
+
+```{r bootstrap-summary}
+bootstrap_summary <- bootstrap_params %>%
+  filter(converged) %>%
+  group_by(cell_line, channel) %>%
+  summarize(
+    n_converged = n(),
+    n_total     = n_bootstrap_iterations,
+    across(
+      c(matches("^C$"), matches("^A[0-9]+$"), matches("^k[0-9]+$"),
+        matches("^tau_[0-9]+$"), mobile_fraction, immobile_fraction),
+      list(median = ~median(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+bootstrap_summary %>% knitr::kable(digits = 4)
+```
+
+### Bootstrap vs. single best fit of the average curve
+
+Compares the bootstrap's median ± SD for each parameter against the single
+fit obtained by fitting `bootstrap_model` directly to the full,
+un-resampled average curve (the same fit validated in `fit_results`
+before the bootstrap ran) - i.e. "what you'd report from one fit to all
+the pooled data" vs. "what the bootstrap says that estimate's uncertainty
+actually looks like." `z_single_fit_vs_bootstrap` is how many bootstrap
+SDs the single fit sits from the bootstrap median - values well outside
+roughly ±2 suggest the single fit on the full average curve landed
+somewhere the resampled curves don't often reach.
+
+Instead of `mobile_fraction`/`immobile_fraction`, the plot below shows
+`unrecovered_raw` (`1 - C - sum(A_i)`, with no division) alongside the
+other fit parameters.
+
+```{r bootstrap-vs-single-fit}
+param_cols_all <- bootstrap_params %>%
+  select(matches("^C$"), matches("^A[0-9]+$"), matches("^k[0-9]+$"),
+         matches("^tau_[0-9]+$"), unrecovered_raw) %>%
+  names()
+
+bootstrap_param_stats <- bootstrap_params %>%
+  filter(converged) %>%
+  select(cell_line, channel, all_of(param_cols_all)) %>%
+  pivot_longer(cols = all_of(param_cols_all), names_to = "parameter", values_to = "value") %>%
+  group_by(cell_line, channel, parameter) %>%
+  summarize(
+    bootstrap_median = median(value, na.rm = TRUE),
+    bootstrap_sd     = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+single_fit_params <- fit_results %>%
+  filter(model == bootstrap_model, converged) %>%
+  select(cell_line, channel, any_of(param_cols_all)) %>%
+  pivot_longer(cols = -c(cell_line, channel), names_to = "parameter", values_to = "single_fit_value")
+
+bootstrap_vs_single_fit <- single_fit_params %>%
+  inner_join(bootstrap_param_stats, by = c("cell_line", "channel", "parameter")) %>%
+  mutate(
+    diff                      = single_fit_value - bootstrap_median,
+    z_single_fit_vs_bootstrap = diff / bootstrap_sd
+  ) %>%
+  arrange(cell_line, channel, parameter)
+
+bootstrap_vs_single_fit %>% knitr::kable(digits = 4)
+```
+
+```{r plot-bootstrap-vs-single-fit, fig.width=12, fig.height=10}
+for (ch in unique(bootstrap_vs_single_fit$channel)) {
+
+  df <- bootstrap_vs_single_fit %>%
+    filter(channel == ch, cell_line != "H2B",
+           cell_line %in% select_cell_lines(unique(bootstrap_vs_single_fit$cell_line)))
+
+  q <- ggplot(df, aes(x = cell_line, y = bootstrap_median, fill = cell_line)) +
+    geom_col(alpha = 0.6, width = 0.7) +
+    geom_point(
+      aes(y = single_fit_value), shape = 23, size = 2.5,
+      fill = "black", color = "black"
+    ) +
+    facet_wrap(~ parameter, scales = "free", ncol = 4) +
+    labs(
+      title = paste0("Channel: ", ch, " - bootstrap median ± SD vs. single average-curve fit"),
+      subtitle = "Bar = bootstrap median; black diamond = single fit to the full average curve",
+      x = "Cell line", y = "Value"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+  print(q)
+
+   p <- ggplot(df, aes(x = cell_line, y = bootstrap_median, fill = cell_line)) +
+    geom_col(alpha = 0.6, width = 0.7) +
+    geom_errorbar(
+      aes(ymin = bootstrap_median - bootstrap_sd, ymax = bootstrap_median + bootstrap_sd),
+      width = 0.25, color = "#D95F02", linewidth = 0.8
+    ) +
+    geom_point(
+      aes(y = single_fit_value), shape = 23, size = 2.5,
+      fill = "black", color = "black"
+    ) +
+    facet_wrap(~ parameter, scales = "free", ncol = 4) +
+    labs(
+      title = paste0("Channel: ", ch, " - bootstrap median ± SD vs. single average-curve fit"),
+      subtitle = "Bar + orange error bar = bootstrap median ± 1 SD; black diamond = single fit to the full average curve",
+      x = "Cell line", y = "Value"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+  print(p)
+}
+```
+
+
+### Bootstrap: distribution across iterations (violin plots) and significance tests
+
+The bar plots above only show each parameter's bootstrap median ± SD. The
+plots below show the **whole distribution** of the bootstrap values for
+each parameter as a violin plot on a **linear y-axis**, one violin per cell line, using
+the same cell lines as the corresponding bar plot. A single horizontal
+line inside each violin marks its median; no boxplot is drawn. All finite
+values, including zero and negative values, are shown where present.
+
+**Significance test.** For every parameter, every pair of plotted cell
+lines is compared with a **bootstrap difference test**. Because each cell
+line is resampled independently, pairing every iteration of cell line A
+with every iteration of cell line B gives the bootstrap distribution of
+the difference `A - B`. The two-sided p-value is
+`2 * min(P(A > B), P(A < B))` (ties count half) - i.e. how often the
+difference falls on the "wrong" side of zero, doubled. `prob_1_greater` in
+the table is `P(group1 > group2)`: 0.5 means the two distributions fully
+overlap, values near 0 or 1 mean they barely overlap. Two things to keep in
+mind:
+
+* Under each violin plot, a second set of plots shows the **distribution of
+  the differences** `group1 - group2` behind each comparison (one figure per
+  pair of cell lines, one panel per parameter), with a dashed line at 0.
+  The p-value is the doubled share of the distribution on the smaller side
+  of that line. The plotted differences are a random sample of 20,000
+  pairings (the p-values and `prob_1_greater` use *all* pairings), and the
+  x-axis shows the central 99% of that sample so a few extreme pairings
+  don't squash the panels.
+* The number of bootstrap iterations is arbitrary, so a plain
+  Wilcoxon/t-test on the iterations would have p-values that shrink toward 0
+  just by running more iterations; this test doesn't have that problem, but
+  its resolution is limited to about `1 / n_iterations`, so p-values are
+  floored there (shown as `<`).
+* With more than two cell lines, p-values are Holm-adjusted across the
+  pairwise comparisons within each parameter (`p_adj`). Stars on the plots
+  are based on `p_adj`: `ns` p >= 0.05, `*` < 0.05, `**` < 0.01,
+  `***` < 0.001.
+
+```{r bootstrap-violin-helpers}
+p_to_stars <- function(p) {
+  case_when(is.na(p) ~ "NA", p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns")
+}
+
+# Pairwise bootstrap difference test between cell lines, per parameter.
+# `long_df` needs columns cell_line, parameter, value (one channel).
+# P(A > B) over all pairings of A's and B's iterations equals the
+# Mann-Whitney U statistic / (nA * nB), so it is computed from ranks
+# instead of building the nA x nB matrix of differences.
+bootstrap_pairwise_tests <- function(long_df) {
+  # fewer than two cell lines -> nothing to compare (empty table, same columns)
+  if (n_distinct(long_df$cell_line) < 2) {
+    return(tibble(
+      parameter = character(), group1 = character(), group2 = character(),
+      n1 = integer(), n2 = integer(), median1 = numeric(), median2 = numeric(),
+      prob_1_greater = numeric(), p_raw = numeric(), p_floor = numeric(),
+      p_is_floor = logical(), p_value = numeric(), p_adj = numeric(),
+      significance = character(), p_adj_label = character()
+    ))
+  }
+
+  long_df %>%
+    group_by(parameter) %>%
+    group_map(function(d, key) {
+      lines <- sort(unique(d$cell_line))
+      if (length(lines) < 2) return(NULL)
+
+      map_dfr(combn(lines, 2, simplify = FALSE), function(pr) {
+        a <- d$value[d$cell_line == pr[1]]; a <- a[is.finite(a)]
+        b <- d$value[d$cell_line == pr[2]]; b <- b[is.finite(b)]
+        na <- length(a); nb <- length(b)
+
+        out <- tibble(
+          parameter = key$parameter, group1 = pr[1], group2 = pr[2],
+          n1 = na, n2 = nb,
+          median1 = if (na > 0) median(a) else NA_real_,
+          median2 = if (nb > 0) median(b) else NA_real_
+        )
+
+        if (na < 2 || nb < 2) {
+          return(mutate(out, prob_1_greater = NA_real_, p_raw = NA_real_,
+                        p_floor = NA_real_))
+        }
+
+        r    <- rank(c(a, b))
+        u    <- sum(r[seq_len(na)]) - na * (na + 1) / 2
+        prob <- u / (na * nb)
+
+        mutate(out,
+               prob_1_greater = prob,
+               p_raw   = 2 * min(prob, 1 - prob),
+               p_floor = 1 / min(na, nb))
+      })
+    }, .keep = TRUE) %>%
+    bind_rows() %>%
+    mutate(
+      p_is_floor = !is.na(p_raw) & p_raw < p_floor,
+      p_value    = pmax(p_raw, p_floor)
+    ) %>%
+    group_by(parameter) %>%
+    mutate(p_adj = p.adjust(p_value, method = "holm")) %>%
+    ungroup() %>%
+    mutate(
+      significance = p_to_stars(p_adj),
+      p_adj_label  = ifelse(is.na(p_adj), NA_character_,
+                            paste0(ifelse(p_is_floor, "<", ""), sprintf("%.3g", p_adj)))
+    )
+}
+
+# Violin plot on a linear y-axis for one channel, with a median line and
+# significance brackets. Returns the plot, tests table, and pairwise differences.
+bootstrap_violins_and_tests <- function(params_df, param_cols, ch, cell_lines, title, ylab,
+                                        fill_values = NULL, keep_order = FALSE) {
+
+  long <- params_df %>%
+    filter(converged, channel == ch, cell_line %in% cell_lines) %>%
+    select(cell_line, all_of(param_cols)) %>%
+    pivot_longer(cols = all_of(param_cols), names_to = "parameter", values_to = "value") %>%
+    filter(is.finite(value))
+
+  line_levels <- if (keep_order) intersect(cell_lines, unique(long$cell_line)) else sort(unique(long$cell_line))
+  long <- long %>% mutate(cell_line = factor(cell_line, levels = line_levels))
+
+  long_chr <- long %>% mutate(cell_line = as.character(cell_line))
+
+  tests <- bootstrap_pairwise_tests(long_chr) %>%
+    mutate(channel = ch, .before = 1)
+
+  diffs <- bootstrap_pairwise_differences(long_chr)
+
+  # Use all finite values; linear-axis plots can include zero and negatives.
+  long_plot <- long
+
+  # Significance brackets, stacked above each facet's highest violin value
+  # using additive spacing for the linear y-axis.
+  brackets <- tests %>%
+    filter(!is.na(p_adj)) %>%
+    inner_join(long_plot %>% group_by(parameter) %>% summarize(y_top = max(value), .groups = "drop"),
+               by = "parameter") %>%
+    group_by(parameter) %>%
+    mutate(
+      j  = row_number(),
+      x1 = match(group1, line_levels),
+      x2 = match(group2, line_levels),
+      y  = y_top + pmax(abs(y_top) * 0.08, 0.05) * j
+    ) %>%
+    ungroup()
+
+  p <- ggplot(long_plot, aes(x = cell_line, y = value, fill = cell_line)) +
+    geom_violin(alpha = 0.6, scale = "width", trim = TRUE, color = "grey30", linewidth = 0.3) +
+    stat_summary(fun = median, geom = "crossbar", width = 0.28,
+                 fatten = 0, color = "black", linewidth = 0.5) +
+    geom_segment(data = brackets, aes(x = x1, xend = x2, y = y, yend = y),
+                 inherit.aes = FALSE, linewidth = 0.4) +
+    geom_text(data = brackets, aes(x = (x1 + x2) / 2, y = y, label = significance),
+              inherit.aes = FALSE, vjust = -0.3, size = 3.5) +
+    # Invisible points just to leave room above the top bracket
+    geom_blank(data = brackets, aes(x = (x1 + x2) / 2,
+                                    y = y + pmax(abs(y) * 0.05, 0.05)),
+               inherit.aes = FALSE) +
+    facet_wrap(~ parameter, scales = "free", ncol = 4) +
+    # y axis of every panel goes down to (at least) 0
+    expand_limits(y = 0) +
+    labs(
+      title = title,
+      subtitle = paste0("Violin = distribution of kept bootstrap iterations; black line = median; ",
+                        "brackets = Holm-adjusted bootstrap difference test"),
+      x = "Cell line", y = ylab
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+  if (!is.null(fill_values)) p <- p + scale_fill_manual(values = fill_values)
+
+  list(plot = p, tests = tests, diffs = diffs)
+}
+
+# Random sample of pairings of cell line A's and cell line B's iterations,
+# returned as the differences A - B (group1 - group2), per parameter and pair.
+# Only used for plotting - the p-values above use every pairing. The seed is
+# fixed here so the same data always gives the same plotted sample.
+bootstrap_pairwise_differences <- function(long_df, n_pairs = 20000) {
+  set.seed(123)
+
+  long_df %>%
+    group_by(parameter) %>%
+    group_map(function(d, key) {
+      lines <- sort(unique(d$cell_line))
+      if (length(lines) < 2) return(NULL)
+
+      map_dfr(combn(lines, 2, simplify = FALSE), function(pr) {
+        a <- d$value[d$cell_line == pr[1]]; a <- a[is.finite(a)]
+        b <- d$value[d$cell_line == pr[2]]; b <- b[is.finite(b)]
+        if (length(a) < 2 || length(b) < 2) return(NULL)
+
+        tibble(
+          parameter = key$parameter, group1 = pr[1], group2 = pr[2],
+          diff = a[sample.int(length(a), n_pairs, replace = TRUE)] -
+                 b[sample.int(length(b), n_pairs, replace = TRUE)]
+        )
+      })
+    }, .keep = TRUE) %>%
+    bind_rows()
+}
+
+# One figure per pair of cell lines: histogram of group1 - group2 for every
+# parameter (facets), coloured by which side of 0 each pairing falls on,
+# dashed line at 0, and the test result written in the corner of each panel.
+# Returns a list of ggplot objects.
+plot_bootstrap_differences <- function(diffs, tests, ch) {
+  if (nrow(diffs) == 0) return(list())
+
+  comps <- diffs %>% distinct(group1, group2)
+
+  map(seq_len(nrow(comps)), function(i) {
+    g1 <- comps$group1[i]
+    g2 <- comps$group2[i]
+    lab_pos <- paste0(g1, " > ", g2)
+    lab_neg <- paste0(g1, " < ", g2)
+
+    d <- diffs %>%
+      filter(group1 == g1, group2 == g2) %>%
+      group_by(parameter) %>%
+      filter(diff >= quantile(diff, 0.005), diff <= quantile(diff, 0.995)) %>%
+      ungroup() %>%
+      mutate(side = factor(ifelse(diff > 0, lab_pos, lab_neg), levels = c(lab_pos, lab_neg)))
+
+    ann <- tests %>%
+      filter(group1 == g1, group2 == g2, !is.na(p_adj)) %>%
+      mutate(label = sprintf("P(%s > %s) = %.3f\np_adj %s  %s",
+                             g1, g2, prob_1_greater,
+                             ifelse(p_is_floor, paste0("< ", sprintf("%.3g", p_adj)),
+                                    paste0("= ", sprintf("%.3g", p_adj))),
+                             significance))
+
+    ggplot(d, aes(x = diff, fill = side)) +
+      geom_histogram(bins = 60, color = "white", linewidth = 0.1) +
+      geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6) +
+      geom_text(data = ann, aes(x = Inf, y = Inf, label = label),
+                hjust = 1.05, vjust = 1.3, size = 3, inherit.aes = FALSE) +
+      scale_fill_manual(values = setNames(c("#D95F02", "#2C7FB8"), c(lab_pos, lab_neg))) +
+      facet_wrap(~ parameter, scales = "free", ncol = 4) +
+      labs(
+        title = paste0("Channel: ", ch, " - bootstrap differences: ", g1, " - ", g2),
+        subtitle = paste0("Random sample of pairings of bootstrap iterations (central 99% shown); dashed line = 0 (no difference). ",
+                          "Labels use all pairings."),
+        x = paste0("Difference (", g1, " - ", g2, ")"), y = "Number of pairings", fill = NULL
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  })
+}
+
+# collected across channels/plots, written out in the export chunk at the end
+bootstrap_violin_tests_list <- list()
+
+# prints one channel's pairwise tests table
+print_violin_tables <- function(res) {
+  cat("\n\n")
+  print(knitr::kable(
+    res$tests %>%
+      select(parameter, group1, group2, n1, n2, median1, median2,
+             prob_1_greater, p_adj = p_adj_label, significance),
+    digits = 4
+  ))
+  cat("\n\n")
+}
+```
+
+```{r plot-bootstrap-violins, fig.width=12, fig.height=10, results="asis"}
+for (ch in unique(bootstrap_vs_single_fit$channel)) {
+
+  # same cell lines as the bar plot above (H2B excluded, cell_lines_to_plot respected)
+  lines_ch <- setdiff(
+    select_cell_lines(unique(bootstrap_params$cell_line[bootstrap_params$channel == ch])),
+    "H2B"
+  )
+
+  res <- bootstrap_violins_and_tests(
+    bootstrap_params, param_cols_all, ch, lines_ch,
+    title = paste0("Channel: ", ch, " - bootstrap distributions by cell line"),
+    ylab  = "Value"
+  )
+
+  bootstrap_violin_tests_list[[length(bootstrap_violin_tests_list) + 1]] <-
+    mutate(res$tests, plot = "fit parameters")
+
+  print(res$plot)
+  print_violin_tables(res)
+
+  for (pl in plot_bootstrap_differences(res$diffs, res$tests, ch)) print(pl)
+}
+```
+
+### Bootstrap: A_i and unrecovered fraction, each divided by (1 - C)
+
+Same idea as the per-replicate version above, but for the bootstrap:
+`A_i / (1 - C)` for each component actually present in `bootstrap_model`,
+plus `frac_unrecovered = unrecovered_raw / (1 - C)` - together these sum
+to 1. Bootstrap median ± SD is compared against the single fit to the
+full average curve, exactly like the comparison above, just restricted to
+this "divided by 1 - C" group of variables so it isn't mixed in with `C`,
+`k_i`, and `tau_i` on very different scales.
+
+```{r bootstrap-vs-single-fit-fractions}
+param_cols_fractions <- bootstrap_params %>%
+  select(matches("^frac_A[0-9]+$"), frac_unrecovered) %>%
+  names()
+
+bootstrap_fraction_stats <- bootstrap_params %>%
+  filter(converged) %>%
+  select(cell_line, channel, all_of(param_cols_fractions)) %>%
+  pivot_longer(cols = all_of(param_cols_fractions), names_to = "parameter", values_to = "value") %>%
+  group_by(cell_line, channel, parameter) %>%
+  summarize(
+    bootstrap_median = median(value, na.rm = TRUE),
+    bootstrap_sd     = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+single_fit_fraction_params <- fit_results %>%
+  filter(model == bootstrap_model, converged) %>%
+  select(cell_line, channel, any_of(param_cols_fractions)) %>%
+  pivot_longer(cols = -c(cell_line, channel), names_to = "parameter", values_to = "single_fit_value")
+
+bootstrap_vs_single_fit_fractions <- single_fit_fraction_params %>%
+  inner_join(bootstrap_fraction_stats, by = c("cell_line", "channel", "parameter")) %>%
+  mutate(
+    diff                      = single_fit_value - bootstrap_median,
+    z_single_fit_vs_bootstrap = diff / bootstrap_sd
+  ) %>%
+  arrange(cell_line, channel, parameter)
+
+bootstrap_vs_single_fit_fractions %>% knitr::kable(digits = 4)
+```
+
+```{r plot-bootstrap-vs-single-fit-fractions, fig.width=12, fig.height=6}
+for (ch in unique(bootstrap_vs_single_fit_fractions$channel)) {
+
+  df <- bootstrap_vs_single_fit_fractions %>%
+    filter(channel == ch,
+           cell_line %in% select_cell_lines(unique(bootstrap_vs_single_fit_fractions$cell_line)))
+
+  p <- ggplot(df, aes(x = cell_line, y = bootstrap_median, fill = cell_line)) +
+    geom_col(alpha = 0.6, width = 0.7) +
+    geom_errorbar(
+      aes(ymin = bootstrap_median - bootstrap_sd, ymax = bootstrap_median + bootstrap_sd),
+      width = 0.25, color = "#D95F02", linewidth = 0.8
+    ) +
+    geom_point(
+      aes(y = single_fit_value), shape = 23, size = 2.5,
+      fill = "black", color = "black"
+    ) +
+    facet_wrap(~ parameter, scales = "free", ncol = 4) +
+    labs(
+      title = paste0("Channel: ", ch, " - A_i and unrecovered fraction (each / (1 - C))"),
+      subtitle = "Bar + orange error bar = bootstrap median ± 1 SD; black diamond = single fit to the full average curve",
+      x = "Cell line", y = "Value / (1 - C)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+  print(p)
+}
+```
+
+```{r plot-bootstrap-violins-fractions, fig.width=12, fig.height=6, results="asis"}
+for (ch in unique(bootstrap_vs_single_fit_fractions$channel)) {
+
+  lines_ch <- select_cell_lines(unique(bootstrap_params$cell_line[bootstrap_params$channel == ch]))
+
+  res <- bootstrap_violins_and_tests(
+    bootstrap_params, param_cols_fractions, ch, lines_ch,
+    title = paste0("Channel: ", ch, " - A_i and unrecovered fraction (each / (1 - C)), bootstrap distributions"),
+    ylab  = "Value / (1 - C)"
+  )
+
+  bootstrap_violin_tests_list[[length(bootstrap_violin_tests_list) + 1]] <-
+    mutate(res$tests, plot = "fractions / (1 - C)")
+
+  print(res$plot)
+  print_violin_tables(res)
+
+  for (pl in plot_bootstrap_differences(res$diffs, res$tests, ch)) print(pl)
+}
+```
+
+### Bootstrap: focused pairwise comparisons (one PDF per metric per comparison)
+
+Three focused comparisons - HOXC10 vs HOXC13, HOXC10 vs HOXC10-13-10, and
+HOXC13 vs HOXC13-10-13 - each with **one violin plot per metric** (every
+fit parameter such as `k1`, `k2`, `tau_1`, ..., plus the `/ (1 - C)`
+fractions), using the colors defined in the Parameters section. Each plot
+is shown below and also exported as its own PDF to
+`pdf_figures/violin_comparisons/<comparison>/`.
+
+**Statistical testing** (same scheme as the slow-recovery bootstrap script).
+Each comparison is tested on only its two cell lines, with the same bootstrap
+difference test as above (P(A > B) over all pairings, p = 2 × min(P, 1 − P),
+floored at 1 / n). Within each comparison:
+
+* **Holm family** (Holm-corrected together): `holm_params_focused` - C, the
+  fractions frac_A1, frac_A2 (, frac_A3), frac_unrecovered and the time
+  constants tau_1, tau_2 (, tau_3).
+* **Tested, not corrected** (marked `°` on the plots): the raw amplitudes
+  A1, A2 (, A3), the rates k1, k2 (, k3), and unrecovered_raw.
+* **Not tested**: `untested_params_focused` (empty by default; any parameter
+  listed there is still plotted, without a bracket).
+
+There is no additional correction across the three comparisons. These tests
+are also appended to `bootstrap_pairwise_cell_line_tests.csv` in the export
+chunk below. These plots ignore `cell_lines_to_plot`.
+
+```{r export-pairwise-violins, fig.width=4.5, fig.height=5}
+violin_comparisons <- list(
+  list(name = "HOXC10_vs_HOXC13",       lines = c("HOXC10", "HOXC13")),
+  list(name = "HOXC10_vs_HOXC10-13-10", lines = c("HOXC10", "HOXC10-13-10")),
+  list(name = "HOXC13_vs_HOXC13-10-13", lines = c("HOXC13", "HOXC13-10-13"))
+)
+
+# Holm family and untested parameters for the focused comparisons
+holm_params_focused     <- c("C", "frac_A1", "frac_A2", "frac_A3", "frac_unrecovered",
+                             "tau_1", "tau_2", "tau_3")
+untested_params_focused <- character(0)
+
+focused_metrics <- c(param_cols_all, param_cols_fractions)
+
+# One violin plot for one metric of one comparison, with the (already
+# corrected) test result of that metric as a single bracket.
+plot_focused_violin <- function(long, tests_comp, metric, lines, title) {
+  d <- long %>%
+    filter(parameter == metric) %>%
+    mutate(cell_line = factor(cell_line, levels = lines))
+  if (nrow(d) == 0) return(NULL)
+
+  y_top <- max(d$value)
+  step  <- max(diff(range(d$value)) * 0.08, abs(y_top) * 0.02, 1e-9)
+
+  br <- tests_comp %>%
+    filter(parameter == metric, !is.na(p_adj)) %>%
+    mutate(x1 = 1, x2 = 2, y = y_top + step,
+           label = paste0(significance, ifelse(in_holm, "", "°")))
+
+  p <- ggplot(d, aes(x = cell_line, y = value, fill = cell_line)) +
+    geom_violin(alpha = 0.6, scale = "width", trim = TRUE, color = "grey30", linewidth = 0.3) +
+    stat_summary(fun = median, geom = "crossbar", width = 0.28,
+                 fatten = 0, color = "black", linewidth = 0.5) +
+    scale_fill_manual(values = cell_line_colors) +
+    # y axis goes down to (at least) 0
+    expand_limits(y = 0) +
+    labs(title = title,
+         subtitle = paste0(metric, ": ",
+                           if (metric %in% untested_params_focused) "not tested"
+                           else if (metric %in% holm_params_focused) "Holm-corrected"
+                           else "uncorrected (°)"),
+         x = NULL, y = metric) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+  if (nrow(br) > 0) {
+    p <- p +
+      geom_segment(data = br, aes(x = x1, xend = x2, y = y, yend = y),
+                   inherit.aes = FALSE, linewidth = 0.4) +
+      geom_text(data = br, aes(x = 1.5, y = y, label = label),
+                inherit.aes = FALSE, vjust = -0.3, size = 3.5) +
+      geom_blank(data = br, aes(x = 1.5, y = y + step), inherit.aes = FALSE)
+  }
+  p
+}
+
+focused_tests_list <- list()
+
+for (ch in channels_to_model) {
+  for (comp in violin_comparisons) {
+
+    present <- intersect(
+      comp$lines,
+      unique(bootstrap_params$cell_line[bootstrap_params$channel == ch & bootstrap_params$converged])
+    )
+
+    if (length(present) < 2) {
+      message(sprintf("Skipping %s, channel '%s': need both cell lines with kept bootstrap iterations.",
+                      comp$name, ch))
+      next
+    }
+
+    comp_dir <- file.path(pdf_export_folder, "violin_comparisons", comp$name)
+    dir.create(comp_dir, showWarnings = FALSE, recursive = TRUE)
+
+    long <- bootstrap_params %>%
+      filter(converged, channel == ch, cell_line %in% comp$lines) %>%
+      select(cell_line, all_of(focused_metrics)) %>%
+      pivot_longer(cols = all_of(focused_metrics), names_to = "parameter", values_to = "value") %>%
+      filter(is.finite(value))
+
+    # all tests of this comparison first, then Holm over the Holm family only
+    tests_comp <- bootstrap_pairwise_tests(
+      long %>% filter(!parameter %in% untested_params_focused)
+    ) %>%
+      mutate(in_holm = parameter %in% holm_params_focused) %>%
+      mutate(p_adj = {
+        pa <- p_value                                    # not in the Holm family: uncorrected
+        pa[in_holm] <- p.adjust(p_value[in_holm], method = "holm")
+        pa
+      }) %>%
+      mutate(significance = p_to_stars(p_adj),
+             p_adj_label  = ifelse(is.na(p_adj), NA_character_,
+                                   paste0(ifelse(p_is_floor, "<", ""), sprintf("%.3g", p_adj))),
+             channel = ch, .before = 1)
+
+    for (metric in focused_metrics) {
+      p <- plot_focused_violin(long, tests_comp, metric, comp$lines,
+                               paste0(ch, " - ", comp$lines[1], " vs. ", comp$lines[2]))
+      if (is.null(p)) next
+
+      # show in the knitted document as well as saving the PDF
+      print(p)
+      ggsave(file.path(comp_dir, paste0(ch, "_", metric, ".pdf")),
+             p, width = 4.5, height = 5, device = "pdf")
+    }
+
+    focused_tests_list[[length(focused_tests_list) + 1]] <-
+      mutate(tests_comp, comparison = comp$name, plot = paste0("pairwise: ", comp$name))
+  }
+}
+
+focused_tests <- bind_rows(focused_tests_list)
+
+bootstrap_violin_tests_list[[length(bootstrap_violin_tests_list) + 1]] <- focused_tests
+
+focused_tests %>%
+  select(comparison, parameter, group1, group2, n1, n2, median1, median2,
+         prob_1_greater, p_value, p_adj = p_adj_label, holm_corrected = in_holm, significance) %>%
+  knitr::kable(digits = 4)
+```
+
+### Bootstrap: composition of the recovery (C / 1 - C and stacked fractions)
+
+For each of the three focused comparisons (`violin_comparisons` above), two
+plots with one stacked bar per cell line, from the kept bootstrap iterations
+of `bootstrap_model`:
+
+* **C and 1 - C**: median of C, and 1 - median(C) on top, so each bar adds up
+  to 1. Error bar: ± 1 SD of C across iterations, at the top of the C segment.
+* **Fractions**: medians of the `frac_A*` columns (frac_A1 at the bottom) and
+  `frac_unrecovered` on top. Each fraction's error bar (± 1 SD across
+  iterations) is drawn at the top of its own segment. A negative median
+  frac_unrecovered is not drawn (with a warning). Because each fraction's
+  median is taken separately, the stack does not have to add up to exactly 1.
+
+Both plots are shown below and exported as PDFs to
+`pdf_figures/composition/<comparison>/`. These plots ignore
+`cell_lines_to_plot`.
+
+```{r composition-plots, fig.width=4.5, fig.height=5.5, results="asis"}
+frac_A_cols <- sort(grep("^frac_A[0-9]+$", names(bootstrap_params), value = TRUE))
+frac_comp   <- c(frac_A_cols, "frac_unrecovered")
+frac_alpha  <- setNames(c(seq(1, 0.4, length.out = length(frac_A_cols)), 0.15), frac_comp)
+C_alpha     <- c("C" = 0.9, "1 - C" = 0.25)
+
+composition_stats <- bootstrap_params %>%
+  filter(converged) %>%
+  group_by(cell_line, channel) %>%
+  summarize(n_kept = n(),
+            across(all_of(c("C", frac_comp)),
+                   list(median = ~median(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop")
+
+cat("\n\n")
+print(knitr::kable(composition_stats, digits = 4))
+cat("\n\n")
+
+# stacked bars drawn as rectangles: x = position of the cell line in the pair
+stacked_plot <- function(seg, err, alpha_vals, title, ylab) {
+  ggplot() +
+    geom_rect(data = seg, aes(xmin = x - 0.35, xmax = x + 0.35, ymin = ymin, ymax = ymax,
+                              fill = cell_line, alpha = component),
+              color = "grey20", linewidth = 0.3) +
+    geom_errorbar(data = err, aes(x = x, ymin = y - sd, ymax = y + sd),
+                  width = 0.15, linewidth = 0.5) +
+    scale_x_continuous(breaks = seq_along(unique(seg$cell_line)),
+                       labels = unique(seg$cell_line), expand = expansion(add = 0.5)) +
+    scale_fill_manual(values = cell_line_colors, guide = "none") +
+    scale_alpha_manual(values = alpha_vals, name = NULL,
+                       guide = guide_legend(override.aes = list(fill = "grey30"),
+                                            reverse = TRUE)) +
+    labs(title = title, subtitle = paste0("Bootstrap ", bootstrap_model,
+                                          ": median, error bar = ± 1 SD"),
+         x = NULL, y = ylab) +
+    theme_minimal() +
+    theme(legend.position = "right", panel.grid.major.x = element_blank())
+}
+
+for (ch in channels_to_model) {
+  for (comp in violin_comparisons) {
+
+    st <- composition_stats %>%
+      filter(channel == ch, cell_line %in% comp$lines) %>%
+      mutate(x = match(cell_line, comp$lines)) %>%
+      arrange(x)
+    if (nrow(st) < 2) {
+      message(sprintf("Skipping composition plots for %s, channel '%s': need both cell lines.",
+                      comp$name, ch))
+      next
+    }
+
+    comp_dir <- file.path(pdf_export_folder, "composition", comp$name)
+    dir.create(comp_dir, showWarnings = FALSE, recursive = TRUE)
+
+    # ---- C and 1 - C ----
+    seg_C <- bind_rows(
+      st %>% transmute(cell_line, x, component = "C",     ymin = 0,        ymax = C_median),
+      st %>% transmute(cell_line, x, component = "1 - C", ymin = C_median, ymax = 1)
+    ) %>% mutate(component = factor(component, levels = names(C_alpha)))
+    err_C <- st %>% transmute(x, y = C_median, sd = C_sd)
+
+    pC <- stacked_plot(seg_C, err_C, C_alpha,
+                       paste0(ch, " - C and 1 - C: ", comp$lines[1], " vs. ", comp$lines[2]),
+                       "Fraction of pre-bleach intensity")
+    print(pC)
+    cat("\n\n")
+    ggsave(file.path(comp_dir, paste0(ch, "_C_composition.pdf")),
+           pC, width = 4.5, height = 5.5, device = "pdf")
+
+    # ---- fractions ----
+    seg_list <- list(); err_list <- list()
+    for (j in seq_len(nrow(st))) {
+      cl  <- st$cell_line[j]
+      med <- unlist(st[j, paste0(frac_comp, "_median")]); names(med) <- frac_comp
+      sdv <- unlist(st[j, paste0(frac_comp, "_sd")]);     names(sdv) <- frac_comp
+
+      comps <- frac_comp
+      if (!is.finite(med[["frac_unrecovered"]]) || med[["frac_unrecovered"]] < 0) {
+        warning(sprintf("%s (%s): median frac_unrecovered = %.4f is negative - not plotted.",
+                        cl, ch, med[["frac_unrecovered"]]))
+        comps <- setdiff(comps, "frac_unrecovered")
+      }
+      tops <- cumsum(med[comps])
+      seg_list[[j]] <- tibble(cell_line = cl, x = st$x[j], component = comps,
+                              ymin = c(0, head(tops, -1)), ymax = tops)
+      err_list[[j]] <- tibble(x = st$x[j], y = tops, sd = sdv[comps])
+    }
+    seg_F <- bind_rows(seg_list) %>% mutate(component = factor(component, levels = frac_comp))
+    err_F <- bind_rows(err_list)
+
+    pF <- stacked_plot(seg_F, err_F, frac_alpha,
+                       paste0(ch, " - fractions of the bleached amount: ",
+                              comp$lines[1], " vs. ", comp$lines[2]),
+                       "Fraction of 1 - C")
+    print(pF)
+    cat("\n\n")
+    ggsave(file.path(comp_dir, paste0(ch, "_fractions_composition.pdf")),
+           pF, width = 4.5, height = 5.5, device = "pdf")
+  }
+}
+```
+
+### Diagnostic: unique curves used per iteration
+
+Curves are drawn **with replacement**, so each iteration's `x` draws
+usually contain repeats. This plots how many *distinct* individual curves
+actually went into each iteration's resampled average curve (out of `x`
+total draws) - a low, erratic count would suggest the curve pool is too
+small for the draws to be very independent of each other.
+
+```{r plot-bootstrap-n-unique, fig.width=8, fig.height=4}
+for (cl in select_cell_lines(unique(bootstrap_params$cell_line))) {
+  for (ch in unique(bootstrap_params$channel[bootstrap_params$cell_line == cl])) {
+
+    df <- bootstrap_params %>% filter(cell_line == cl, channel == ch)
+
+    p <- ggplot(df, aes(x = iteration, y = n_unique_curves)) +
+      geom_point(color = "#2C7FB8", size = 1, alpha = 0.6) +
+      labs(
+        title = paste0("Cell line: ", cl, ", channel: ", ch,
+                        " - unique curves drawn per bootstrap iteration"),
+        subtitle = paste0(unique(df$n_curves_drawn), " curves drawn per iteration, with replacement"),
+        x = "Iteration", y = "Number of unique curves"
+      ) +
+      theme_minimal()
+
+    print(p)
+  }
+}
+```
+
+### Diagnostic: C and amplitude parameters across iterations
+
+Plots `C` together with whichever amplitude terms (`A1`, `A2`, `A3`)
+actually exist in `bootstrap_params` - i.e. only as many as
+`bootstrap_model` has (one for mono-exponential, two for bi-exponential,
+three for tri-exponential), so nothing errors if a term isn't there.
+
+```{r plot-bootstrap-params-scatter, fig.width=8, fig.height=7}
+params_to_plot <- intersect(c("C", "A1", "A2", "A3", "tau_1", "tau_2", "tau_3"), names(bootstrap_params))
+
+bootstrap_long_cA <- bootstrap_params %>%
+  filter(converged) %>%
+  select(cell_line, channel, iteration, all_of(params_to_plot)) %>%
+  pivot_longer(cols = all_of(params_to_plot), names_to = "parameter", values_to = "value")
+
+for (cl in select_cell_lines(unique(bootstrap_long_cA$cell_line))) {
+  for (ch in unique(bootstrap_long_cA$channel[bootstrap_long_cA$cell_line == cl])) {
+
+    df <- bootstrap_long_cA %>% filter(cell_line == cl, channel == ch)
+
+    p <- ggplot(df, aes(x = iteration, y = value)) +
+      geom_point(size = 1, alpha = 0.6, color = "#2C7FB8") +
+      facet_wrap(~ parameter, scales = "free_y", ncol = 2) +
+      labs(
+        title = paste0("Cell line: ", cl, ", channel: ", ch,
+                        " - C and amplitude parameters across iterations"),
+        x = "Iteration", y = "Parameter value"
+      ) +
+      theme_minimal()
+
+    print(p)
+  }
+}
+```
+
+
+
+### Diagnostic: amplitude vs. inverse rate constant
+
+For each iteration, plots `A1` against `1/k1`, `A2` against `1/k2`, and
+`A3` against `1/k3` - each pair is skipped automatically if it doesn't
+exist for the chosen model (e.g. `A2`/`k2` and `A3`/`k3` are both skipped
+for a mono-exponential fit; only `A3`/`k3` is skipped for a bi-exponential
+one), so nothing errors regardless of which model was fit.
+
+```{r plot-bootstrap-amplitude-vs-invk, fig.width=8, fig.height=4}
+inv_k_pairs <- list(c("A1", "k1"), c("A2", "k2"), c("A3", "k3"))
+
+for (pair in inv_k_pairs) {
+  amp_col <- pair[1]
+  k_col   <- pair[2]
+
+  if (!all(c(amp_col, k_col) %in% names(bootstrap_params))) next
+
+  df_pair <- bootstrap_params %>%
+    filter(converged) %>%
+    mutate(inv_k = 1 / .data[[k_col]])
+
+  for (cl in select_cell_lines(unique(df_pair$cell_line))) {
+    for (ch in unique(df_pair$channel[df_pair$cell_line == cl])) {
+
+      df <- df_pair %>% filter(cell_line == cl, channel == ch)
+
+      if (nrow(df) == 0) next
+
+      p <- ggplot(df, aes(x = .data[[amp_col]], y = inv_k)) +
+        geom_point(color = "#31A354", size = 1, alpha = 0.6) +
+        labs(
+          title = paste0("Cell line: ", cl, ", channel: ", ch,
+                          " - ", amp_col, " vs. 1/", k_col),
+          subtitle = "Each point is one bootstrap iteration",
+          x = amp_col, y = paste0("1/", k_col)
+        ) +
+        theme_minimal()
+
+      print(p)
+    }
+  }
+}
+```
+
+```{r bootstrap-failed}
+bootstrap_params %>%
+  filter(!converged) %>%
+  count(cell_line, channel, error, name = "n_iterations")
+```
+
+### Export bootstrap results
+
+Saves the raw per-iteration parameters (one row per iteration, so you can
+inspect the full distribution or re-plot it later), the median/SD summary
+table, and the pairwise cell-line significance tests from the violin plots
+to csv files in a `bootstrap_results` subfolder of `curve_folder`.
+
+```{r export-bootstrap}
+bootstrap_export_folder <- file.path(curve_folder, "bootstrap_results")
+dir.create(bootstrap_export_folder, showWarnings = FALSE, recursive = TRUE)
+
+for (cl in unique(bootstrap_params$cell_line)) {
+  for (ch in unique(bootstrap_params$channel[bootstrap_params$cell_line == cl])) {
+    out_file <- file.path(
+      bootstrap_export_folder,
+      paste0(cl, "_", ch, "_bootstrap_iterations.csv")
+    )
+
+    bootstrap_params %>%
+      filter(cell_line == cl, channel == ch) %>%
+      write_csv(out_file)
+  }
+}
+
+summary_file <- file.path(bootstrap_export_folder, "all_cell_lines_bootstrap_summary.csv")
+write_csv(bootstrap_summary, summary_file)
+
+if (length(bootstrap_violin_tests_list) > 0) {
+  write_csv(
+    bind_rows(bootstrap_violin_tests_list),
+    file.path(bootstrap_export_folder, "bootstrap_pairwise_cell_line_tests.csv")
+  )
+}
+
+list.files(bootstrap_export_folder, full.names = TRUE)
+```

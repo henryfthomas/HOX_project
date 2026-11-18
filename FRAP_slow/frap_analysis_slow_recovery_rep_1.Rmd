@@ -1,0 +1,749 @@
+---
+title: "FRAP Data Analysis - Regions Split Across Files, by Movie"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+```
+
+This version handles csv files where each **movie** (acquisition) is split
+across several files instead of having all regions in one file:
+
+- `<movie>_background_results.csv`
+- `<movie>_targeted_1_results.csv`, `<movie>_targeted_2_results.csv`, ...
+- `<movie>_untargeted_1_results.csv`, `<movie>_untargeted_2_results.csv`, ...
+
+e.g. `HOXC10-13-10_001_background_results.csv`,
+`HOXC10-13-10_001_targeted_1_results.csv`,
+`HOXC10-13-10_001_untargeted_1_results.csv`, ... all belong to the same
+movie `HOXC10-13-10_001`. A different movie might be
+`HOXC10-13-10_002_...` or something unrelated like `HOXC13_001_...` — the
+"movie" is simply whatever precedes `_background`/`_targeted_x`/`_untargeted_x`
+in the file name.
+
+All files belonging to the same movie are grouped together: the single
+`background` file from that movie is applied to *every* targeted/untargeted
+region from that movie, and each `targeted_x` file is paired with the
+`untargeted_x` file that shares the same number `x`. Everything else (time
+conversion, background subtraction, pre-bleach normalization,
+targeted/untargeted ratio, cell line grouping) works exactly as before —
+it's just applied per region, pooled across movie, instead of per file.
+
+## Parameters
+
+```{r params}
+data_folder <- "/Volumes/lionnt01lab/lionnt01labspace/Henry/FRAP/2026_07_29_slow_recovery_replicate_1/csv_measurements"
+# --- channel identity ---
+# Name what was measured in each channel. Odd rows in the csv = channel_1,
+# even rows = channel_2. If you only measured a single channel, set
+# channel_2 <- NA and every row will be treated as channel_1 instead of
+# being split into odd/even rows.
+channel_1 <- "GFP"
+channel_2 <- "Halo-JFx650"   # set to NA for single-channel data
+
+# --- acquisition timing (per channel) ---
+n_pre         <- 5     # number of frames pre-bleach
+interval_pre  <- 0.2   # seconds between pre-bleach frames
+
+n_post1        <- 16   # number of frames in post-bleach phase 1
+interval_post1 <- 2.0 # seconds between frames in post-bleach phase 1
+
+n_post2        <- 121   # number of frames in post-bleach phase 2
+interval_post2 <- 10  # seconds between frames in post-bleach phase 2
+
+n_post3        <- 0    # number of frames in post-bleach phase 3
+interval_post3 <- 2.0  # seconds between frames in post-bleach phase 3
+
+# time (s) of the bleach event, measured from the start of acquisition
+# (i.e. the time of the first post-bleach frame - the first frame that
+# actually shows the bleached, low-intensity state). Used internally to
+# shift all times so that the bleach event itself is t = 0: pre-bleach
+# frames (including the last one, right before bleaching) get negative
+# times, post-bleach frames get zero/positive times.
+bleach_time_raw <- (n_pre - 1) * interval_pre + interval_post1
+
+# max number of panels per row in the "per region" grid plots
+max_panels_per_row <- 10
+
+# --- export settings (for comparing replicates later) ---
+# a short label identifying this experiment/replicate, e.g. "replicate_1".
+# Used to tag exported curves so they can be told apart when combined with
+# other replicates in the comparison script.
+replicate_label <- "replicate_1"
+
+# folder where the exported curve csv files will be saved
+# (created automatically if it doesn't exist)
+export_folder <- file.path(data_folder, "exported_curves")
+
+```
+
+## List CSV files
+
+```{r list-files}
+csv_files <- list.files(data_folder, pattern = "\\.csv$", full.names = TRUE)
+csv_files
+```
+
+## Helper: convert frame number to time
+
+Time is expressed relative to the bleach event: the first post-bleach
+frame (the first frame that actually shows the bleached, low-intensity
+state) is shifted to land at `t = 0`. Pre-bleach frames - including the
+last one, right before bleaching - therefore get negative times, and the
+remaining post-bleach frames get positive times.
+
+```{r frame-to-time}
+n_total_expected <- n_pre + n_post1 + n_post2 + n_post3
+
+frame_to_time <- function(frame) {
+  intervals <- c(
+    rep(interval_pre,   max(n_pre - 1, 0)),
+    rep(interval_post1, n_post1),
+    rep(interval_post2, n_post2),
+    rep(interval_post3, n_post3)
+  )
+  times <- c(0, cumsum(intervals))
+  # shift so the bleach event (the first post-bleach frame) is t = 0
+  times[frame] - bleach_time_raw
+}
+
+# the bleach event is now t = 0 by construction (kept as `bleach_time` so
+# the reference line drawn on the plots below still works unchanged)
+bleach_time <- 0
+```
+
+## Parse file names into movie / region type
+
+Each relevant file name is expected to look like
+`<movie>_background_results.csv`, `<movie>_targeted_<n>_results.csv`, or
+`<movie>_untargeted_<n>_results.csv`. `<movie>` is everything before that
+trailing part, and is allowed to contain underscores itself (e.g.
+`HOXC10-13-10_001`). `cell_line` is then taken as everything before the
+*first* `_` in the movie name — exactly as in the previous version, just
+applied to the movie name instead of the (now nonexistent) single combined
+file name.
+
+Any csv in `data_folder` whose name doesn't match one of these three
+patterns (e.g. a stray summary/whole-cell export that isn't one of the
+per-region files) is skipped, with a warning listing what was skipped —
+it is not included in the analysis.
+
+```{r parse-filenames}
+parse_frap_filename <- function(path) {
+  base <- tools::file_path_sans_ext(basename(path))
+  m <- regmatches(base, regexec(
+    "^(.+)_(background|targeted_([0-9]+)|untargeted_([0-9]+))_results$", base
+  ))[[1]]
+
+  if (length(m) == 0) {
+    warning(sprintf(
+      paste(
+        "Skipping file '%s': name doesn't match",
+        "'<movie>_background_results.csv', '<movie>_targeted_<n>_results.csv',",
+        "or '<movie>_untargeted_<n>_results.csv'."
+      ),
+      basename(path)
+    ))
+    return(NULL)
+  }
+
+  movie     <- m[2]
+  kind_full <- m[3]
+  kind      <- sub("_[0-9]+$", "", kind_full)
+  region    <- if (kind == "background") NA_integer_ else as.integer(sub(".*_", "", kind_full))
+
+  tibble(path = path, movie = movie, kind = kind, region = region)
+}
+
+file_index <- map_dfr(csv_files, parse_frap_filename)
+file_index
+```
+
+## Read and reshape
+
+For every movie, we:
+
+1. Read the `background` file, and each `targeted_x` / `untargeted_x`
+   file, assigning `channel`, `frame`, and `time` exactly as before (row
+   parity for two channels, or every row for a single channel).
+2. Pair up `targeted_x` and `untargeted_x` by region number `x`, at each
+   channel/frame.
+3. Join in the movie's single `background` trace by channel/frame, so the
+   same background applies to every region from that movie.
+4. Tag everything with `cell_line` (everything before the first `_` in the
+   movie name), `roi_id`, and `roi_label`, matching the previous version's
+   naming exactly (using the movie name in place of the old per-file name).
+
+If a movie has a `targeted_x` region with no matching `untargeted_x` (or
+vice versa), that region is kept with `NA` for the missing side and a
+warning is printed — it will simply be excluded from ratio plots. Missing
+or duplicate background files for a movie raise an error.
+
+```{r read-data}
+# read one single-region file, split into channel_1/channel_2 by row parity
+# (or a single channel if channel_2 is NA), and compute frame/time
+read_region_file <- function(path, value_name) {
+  df <- read_csv(path, show_col_types = FALSE)
+  df <- df %>% select(-1)
+
+  # the value column: use the Mean(...) column if the file still has one
+  # (e.g. `Mean(background)`, `Mean(targeted_1)`); otherwise fall back to a
+  # plain `Mean` column (ImageJ's default "Measure" output column name);
+  # otherwise assume the single remaining column is the measurement
+  mean_cols <- grep("^Mean\\(", names(df), value = TRUE)
+  if (length(mean_cols) == 1) {
+    df <- df %>% rename(value = !!mean_cols)
+  } else if ("Mean" %in% names(df)) {
+    df <- df %>% rename(value = Mean)
+  } else if (ncol(df) == 1) {
+    df <- df %>% rename(value = 1)
+  } else {
+    stop(sprintf(
+      "%s: could not identify the measurement column (found columns: %s).",
+      basename(path), paste(names(df), collapse = ", ")
+    ))
+  }
+
+  # force the value column to numeric regardless of how read_csv guessed its
+  # type — different files can otherwise end up with different column types
+  # (e.g. one file's Mean column all-numeric -> double, another with a
+  # stray blank/non-numeric cell -> character), which makes bind_rows()
+  # fail when regions are combined across files
+  raw_value  <- df$value
+  df$value   <- suppressWarnings(as.numeric(raw_value))
+  n_new_na   <- sum(is.na(df$value) & !is.na(raw_value))
+  if (n_new_na > 0) {
+    warning(sprintf(
+      "%s: %d value(s) in the measurement column were not numeric and were coerced to NA.",
+      basename(path), n_new_na
+    ))
+  }
+
+  if (is.na(channel_2)) {
+    df <- df %>%
+      mutate(channel = channel_1, frame = row_number())
+  } else {
+    df <- df %>%
+      mutate(
+        row_id  = row_number(),
+        channel = if_else(row_id %% 2 == 1, channel_1, channel_2)
+      ) %>%
+      group_by(channel) %>%
+      mutate(frame = row_number()) %>%
+      ungroup() %>%
+      select(-row_id)
+  }
+
+  if (nrow(df) == 0) {
+    warning(sprintf("%s: file has no data rows — skipping.", basename(path)))
+  } else {
+    n_frames_per_channel <- max(df$frame)
+    if (n_frames_per_channel != n_total_expected) {
+      warning(sprintf(
+        "%s: found %d frames per channel, but n_pre + n_post1 + n_post2 + n_post3 = %d. Check your parameters.",
+        basename(path), n_frames_per_channel, n_total_expected
+      ))
+    }
+  }
+
+  df %>%
+    mutate(time = frame_to_time(frame)) %>%
+    select(channel, frame, time, value) %>%
+    rename(!!value_name := value)
+}
+
+# read and assemble everything for one movie (one background file, and any
+# number of targeted_x / untargeted_x files) into the same long-format shape
+# the rest of the script expects: file, cell_line, channel, frame, time,
+# background, region, targeted, untargeted, roi_id, roi_label
+read_frap_movie <- function(movie_files) {
+  movie     <- movie_files$movie[1]
+  cell_line <- sub("_.*", "", movie)
+
+  bg_files <- movie_files %>% filter(kind == "background")
+  if (nrow(bg_files) == 0) {
+    stop(sprintf("Movie '%s' has no background file.", movie))
+  }
+  if (nrow(bg_files) > 1) {
+    stop(sprintf("Movie '%s' has more than one background file.", movie))
+  }
+  background_df <- read_region_file(bg_files$path[1], "background")
+
+  targeted_files   <- movie_files %>% filter(kind == "targeted")
+  untargeted_files <- movie_files %>% filter(kind == "untargeted")
+
+  if (nrow(targeted_files) == 0 && nrow(untargeted_files) == 0) {
+    warning(sprintf("Movie '%s' has no targeted_x or untargeted_x files — skipping.", movie))
+    return(tibble())
+  }
+
+  empty_region_tbl <- function(value_name) {
+    tibble(channel = character(), frame = integer(), time = numeric(), region = integer()) %>%
+      mutate(!!value_name := numeric())
+  }
+
+  targeted_long <- if (nrow(targeted_files) > 0) {
+    targeted_files %>%
+      pmap_dfr(function(path, region, ...) {
+        read_region_file(path, "targeted") %>% mutate(region = region)
+      })
+  } else {
+    empty_region_tbl("targeted")
+  }
+
+  untargeted_long <- if (nrow(untargeted_files) > 0) {
+    untargeted_files %>%
+      pmap_dfr(function(path, region, ...) {
+        read_region_file(path, "untargeted") %>% mutate(region = region)
+      })
+  } else {
+    empty_region_tbl("untargeted")
+  }
+
+  # pair targeted_x with untargeted_x by region number, then attach the
+  # movie's single background trace to every region
+  roi_long <- full_join(
+    targeted_long, untargeted_long,
+    by = c("channel", "frame", "time", "region")
+  ) %>%
+    left_join(background_df, by = c("channel", "frame", "time"))
+
+  unmatched <- roi_long %>%
+    filter(is.na(targeted) | is.na(untargeted)) %>%
+    pull(region) %>%
+    unique()
+
+  if (length(unmatched) > 0) {
+    warning(sprintf(
+      "%s: region(s) %s have only targeted or only untargeted data (no matching pair). These will be NA in ratio plots.",
+      movie, paste(sort(unmatched), collapse = ", ")
+    ))
+  }
+
+  roi_long %>%
+    mutate(
+      file      = movie,
+      cell_line = cell_line,
+      roi_id    = paste(file, channel, paste0("region", region), sep = " | "),
+      roi_label = paste0(file, " - region ", region)
+    ) %>%
+    select(file, cell_line, channel, frame, time, background, region, targeted, untargeted, roi_id, roi_label)
+}
+
+frap_data <- file_index %>%
+  group_by(movie) %>%
+  group_split() %>%
+  map_dfr(read_frap_movie)
+
+head(frap_data)
+```
+
+## Background subtraction
+
+Computed here (right after reading the data) so both raw and
+background-subtracted intensities can be plotted together below.
+
+```{r background-subtraction}
+frap_data <- frap_data %>%
+  mutate(
+    targeted_bgsub   = targeted   - background,
+    untargeted_bgsub = untargeted - background
+  )
+```
+
+## Raw and background-subtracted intensity plots (per region)
+
+One row per region, with 4 panels per row: raw signal in `channel_1`,
+background-subtracted signal in `channel_1`, raw signal in `channel_2`,
+background-subtracted signal in `channel_2` (only 2 panels per row if
+`channel_2` is `NA`). Each panel has its own independent y-scale.
+
+```{r raw-bgsub-long-format}
+plot_type_levels <- c("Raw", "Background-subtracted")
+channels_present  <- if (is.na(channel_2)) channel_1 else c(channel_1, channel_2)
+panel_levels <- unlist(lapply(channels_present, function(ch) paste(ch, plot_type_levels)))
+
+raw_long <- frap_data %>%
+  pivot_longer(
+    cols      = c(background, targeted, untargeted),
+    names_to  = "measurement",
+    values_to = "intensity"
+  ) %>%
+  mutate(plot_type = "Raw")
+
+bgsub_long <- frap_data %>%
+  select(roi_label, channel, frame, time, targeted_bgsub, untargeted_bgsub) %>%
+  pivot_longer(
+    cols      = c(targeted_bgsub, untargeted_bgsub),
+    names_to  = "measurement",
+    values_to = "intensity"
+  ) %>%
+  mutate(
+    measurement = recode(measurement,
+                          targeted_bgsub   = "targeted",
+                          untargeted_bgsub = "untargeted"),
+    plot_type = "Background-subtracted"
+  )
+
+frap_long_raw_bgsub <- bind_rows(raw_long, bgsub_long) %>%
+  mutate(panel = factor(paste(channel, plot_type), levels = panel_levels))
+
+n_rows <- n_distinct(frap_long_raw_bgsub$roi_label)
+```
+
+```{r plot-raw-bgsub, fig.width=16, fig.height=pmax(8, 3 * n_rows)}
+frap_long_raw_bgsub %>%
+  ggplot(aes(x = time, y = intensity, color = measurement)) +
+  geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50") +
+  geom_line() +
+  geom_point(size = 0.8) +
+  facet_wrap(~ roi_label + panel, ncol = length(panel_levels), scales = "free") +
+  labs(
+    title = "Raw and background-subtracted intensities (per region)",
+    x = "Time (s)", y = "Intensity", color = "Measurement"
+  ) +
+  theme_minimal()
+```
+
+## Normalize to average pre-bleach intensity
+
+Normalization is done per region (`roi_id`), i.e. per file, channel, and
+region number.
+
+```{r normalize-prebleach}
+frap_data <- frap_data %>%
+  group_by(roi_id) %>%
+  mutate(
+    targeted_pre_mean   = mean(targeted_bgsub[frame <= n_pre],   na.rm = TRUE),
+    untargeted_pre_mean = mean(untargeted_bgsub[frame <= n_pre], na.rm = TRUE),
+    targeted_norm       = targeted_bgsub   / targeted_pre_mean,
+    untargeted_norm     = untargeted_bgsub / untargeted_pre_mean
+  ) %>%
+  ungroup()
+
+head(frap_data)
+```
+
+## Normalize targeted to untargeted
+
+```{r normalize-targeted-to-untargeted}
+frap_data <- frap_data %>%
+  mutate(ratio_targeted_to_untargeted = targeted_norm / untargeted_norm)
+
+head(frap_data)
+```
+
+### Shift curves to the first post-bleach measurement
+
+```{r normalize-to-first-postbleach}
+frap_data <- frap_data %>%
+  group_by(roi_id) %>%
+  mutate(
+    ratio_first_postbleach = ratio_targeted_to_untargeted[frame == n_pre + 1],
+    ratio_norm_postbleach1 = ratio_targeted_to_untargeted / ratio_first_postbleach
+  ) %>%
+  ungroup()
+```
+
+### Plot: targeted / untargeted ratio (normalized to pre-bleach), by cell line
+
+All regions from all files belonging to a cell line are overlaid in a
+single plot (faceted by channel), colored by that region's pre-bleach
+`targeted` intensity.
+
+```{r plot-ratio-by-cell-line-prebleach, fig.width=9, fig.height=5}
+for (cl in unique(frap_data$cell_line)) {
+
+  p <- frap_data %>%
+    filter(cell_line == cl) %>%
+    ggplot(aes(x = time, y = ratio_targeted_to_untargeted,
+               group = roi_id, color = targeted_pre_mean)) +
+    geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_line() +
+    geom_point(size = 0.8) +
+    scale_color_viridis_c(name = "Pre-bleach\nintensity") +
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(
+      title = paste("Cell line:", cl, "- targeted/untargeted, normalized to pre-bleach"),
+      x = "Time (s)", y = "Targeted / Untargeted\n(relative to pre-bleach average)"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+### Plot: targeted / untargeted ratio (normalized to first post-bleach frame), by cell line
+
+```{r plot-ratio-by-cell-line, fig.width=9, fig.height=5}
+for (cl in unique(frap_data$cell_line)) {
+
+  p <- frap_data %>%
+    filter(cell_line == cl) %>%
+    ggplot(aes(x = time, y = ratio_norm_postbleach1,
+               group = roi_id, color = targeted_pre_mean)) +
+    geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_line() +
+    geom_point(size = 0.8) +
+    scale_color_viridis_c(name = "Pre-bleach\nintensity") +
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(
+      title = paste("Cell line:", cl, "- targeted/untargeted, normalized to first post-bleach frame"),
+      x = "Time (s)", y = "Targeted / Untargeted\n(relative to first post-bleach frame)"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+## Average curves by cell line (across all regions from all files)
+
+Every region, from every file, belonging to a cell line is pooled together
+here — so a movie contributing 7 targeted/untargeted region pairs
+contributes 7 curves to the average, not just 1. We group by `cell_line`,
+`channel`, and `frame`, and compute the mean and SD of the (pre-bleach
+normalized) targeted/untargeted ratio at each time point.
+
+```{r summarize-by-cell-line}
+frap_summary <- frap_data %>%
+  filter(!is.na(ratio_targeted_to_untargeted)) %>%
+  group_by(cell_line, channel, frame) %>%
+  summarize(
+    time       = first(time),
+    n_regions  = n(),
+    mean_ratio = mean(ratio_targeted_to_untargeted, na.rm = TRUE),
+    sd_ratio   = sd(ratio_targeted_to_untargeted, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+head(frap_summary)
+```
+
+```{r plot-average-by-cell-line, fig.width=8, fig.height=5}
+for (cl in unique(frap_summary$cell_line)) {
+
+  p <- frap_summary %>%
+    filter(cell_line == cl) %>%
+    ggplot(aes(x = time, y = mean_ratio)) +
+    geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_ribbon(
+      aes(ymin = mean_ratio - sd_ratio, ymax = mean_ratio + sd_ratio),
+      alpha = 0.2, fill = "#2C7FB8"
+    ) +
+    geom_line(color = "#2C7FB8", linewidth = 1) +
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(
+      title = paste("Cell line:", cl),
+      subtitle = "Mean targeted/untargeted ratio ± 1 SD, pooled across all regions and files",
+      x = "Time (s)", y = "Targeted / Untargeted"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+## Average curves by cell line, split by pre-bleach intensity tertile
+
+For each cell line (and channel), regions are split into thirds based on
+their `targeted_pre_mean` (average pre-bleach intensity): the third with
+the lowest pre-bleach intensity, the middle third, and the third with the
+highest pre-bleach intensity. `ntile()` is used to divide regions into
+three groups as evenly as possible, ranked by `targeted_pre_mean`. The
+split is done separately per `channel`, since the two channels typically
+have very different intensity scales.
+
+```{r summarize-by-cell-line-tertile}
+prebleach_tertiles <- frap_data %>%
+  filter(!is.na(ratio_targeted_to_untargeted)) %>%
+  distinct(cell_line, channel, roi_id, targeted_pre_mean) %>%
+  group_by(cell_line, channel) %>%
+  mutate(
+    prebleach_tertile = ntile(targeted_pre_mean, 3),
+    prebleach_group   = factor(
+      prebleach_tertile,
+      levels = 1:3,
+      labels = c("Low pre-bleach", "Medium pre-bleach", "High pre-bleach")
+    )
+  ) %>%
+  ungroup() %>%
+  select(cell_line, channel, roi_id, prebleach_group)
+
+frap_data_tertile <- frap_data %>%
+  left_join(prebleach_tertiles, by = c("cell_line", "channel", "roi_id"))
+
+frap_summary_tertile <- frap_data_tertile %>%
+  filter(!is.na(ratio_targeted_to_untargeted), !is.na(prebleach_group)) %>%
+  group_by(cell_line, channel, prebleach_group, frame) %>%
+  summarize(
+    time       = first(time),
+    n_regions  = n(),
+    mean_ratio = mean(ratio_targeted_to_untargeted, na.rm = TRUE),
+    sd_ratio   = sd(ratio_targeted_to_untargeted, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+# how many regions ended up in each tertile, per cell line/channel
+prebleach_tertiles %>%
+  count(cell_line, channel, prebleach_group)
+```
+
+```{r plot-average-by-cell-line-tertile, fig.width=9, fig.height=5}
+tertile_colors <- c(
+  "Low pre-bleach"    = "#3182BD",
+  "Medium pre-bleach" = "#31A354",
+  "High pre-bleach"   = "#DE2D26"
+)
+
+for (cl in unique(frap_summary_tertile$cell_line)) {
+
+  p <- frap_summary_tertile %>%
+    filter(cell_line == cl) %>%
+    ggplot(aes(x = time, y = mean_ratio,
+               color = prebleach_group, fill = prebleach_group)) +
+    geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_ribbon(
+      aes(ymin = mean_ratio - sd_ratio, ymax = mean_ratio + sd_ratio),
+      alpha = 0.15, color = NA
+    ) +
+    geom_line(linewidth = 1) +
+    scale_color_manual(values = tertile_colors, name = "Pre-bleach\nintensity") +
+    scale_fill_manual(values = tertile_colors, guide = "none") +
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(
+      title = paste("Cell line:", cl, "- split by pre-bleach intensity tertile"),
+      subtitle = "Mean targeted/untargeted ratio ± 1 SD; regions split into thirds by pre-bleach intensity",
+      x = "Time (s)", y = "Targeted / Untargeted"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+### Tertile average curves, normalized to the first post-bleach frame
+
+Same tertile grouping as above, but each curve is additionally shifted so
+it starts at 1 on the first post-bleach frame (using `ratio_norm_postbleach1`,
+computed earlier), making it easier to compare recovery kinetics across
+tertiles independent of any small differences right at the pre-bleach
+baseline.
+
+```{r summarize-by-cell-line-tertile-postbleach}
+frap_summary_tertile_postbleach <- frap_data_tertile %>%
+  filter(!is.na(ratio_norm_postbleach1), !is.na(prebleach_group)) %>%
+  group_by(cell_line, channel, prebleach_group, frame) %>%
+  summarize(
+    time       = first(time),
+    n_regions  = n(),
+    mean_ratio = mean(ratio_norm_postbleach1, na.rm = TRUE),
+    sd_ratio   = sd(ratio_norm_postbleach1, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+head(frap_summary_tertile_postbleach)
+```
+
+```{r plot-average-by-cell-line-tertile-postbleach, fig.width=9, fig.height=5}
+for (cl in unique(frap_summary_tertile_postbleach$cell_line)) {
+
+  p <- frap_summary_tertile_postbleach %>%
+    filter(cell_line == cl) %>%
+    ggplot(aes(x = time, y = mean_ratio,
+               color = prebleach_group, fill = prebleach_group)) +
+    geom_vline(xintercept = bleach_time, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "grey70") +
+    geom_ribbon(
+      aes(ymin = mean_ratio - sd_ratio, ymax = mean_ratio + sd_ratio),
+      alpha = 0.15, color = NA
+    ) +
+    geom_line(linewidth = 1) +
+    scale_color_manual(values = tertile_colors, name = "Pre-bleach\nintensity") +
+    scale_fill_manual(values = tertile_colors, guide = "none") +
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(
+      title = paste("Cell line:", cl, "- split by pre-bleach intensity tertile"),
+      subtitle = "Mean targeted/untargeted ratio ± 1 SD, normalized to first post-bleach frame",
+      x = "Time (s)", y = "Targeted / Untargeted\n(relative to first post-bleach frame)"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+## Export curves
+
+Two sets of csv files are written, both tagged with `replicate_label` so
+they can be told apart when combined with other replicates in the
+companion "compare replicates" script:
+
+1. **Average curves** — one row per cell line/channel/frame, with the mean,
+   SD, and number of regions contributing.
+2. **Individual curves** — one row per cell line/channel/region/frame, i.e.
+   every region's curve kept separately (not averaged), for cases where
+   you want to inspect, re-analyze, or re-average the raw per-region data
+   later.
+
+### Average curves
+
+```{r export-average-curves}
+dir.create(export_folder, showWarnings = FALSE, recursive = TRUE)
+
+frap_summary_export <- frap_summary %>%
+  mutate(replicate = replicate_label) %>%
+  select(replicate, cell_line, channel, frame, time, n_regions, mean_ratio, sd_ratio)
+
+for (cl in unique(frap_summary_export$cell_line)) {
+  out_file <- file.path(
+    export_folder,
+    paste0(cl, "_", replicate_label, "_mean_curve.csv")
+  )
+
+  frap_summary_export %>%
+    filter(cell_line == cl) %>%
+    write_csv(out_file)
+}
+
+# list what was written, for confirmation
+list.files(export_folder, pattern = paste0(replicate_label, "_mean_curve\\.csv$"), full.names = TRUE)
+```
+
+### Individual region curves
+
+Each row is one region (`roi_id`), at one frame, keeping both the
+pre-bleach-normalized ratio (`ratio_targeted_to_untargeted`) and the
+version re-normalized to the first post-bleach frame
+(`ratio_norm_postbleach1`), plus enough identifying columns (`file`,
+`region`, `roi_id`) to trace each curve back to its source movie/region.
+
+```{r export-individual-curves}
+frap_individual_export <- frap_data %>%
+  filter(!is.na(ratio_targeted_to_untargeted)) %>%
+  mutate(replicate = replicate_label) %>%
+  select(replicate, cell_line, channel, file, region, roi_id, frame, time,
+         targeted_pre_mean, untargeted_pre_mean,
+         ratio_targeted_to_untargeted, ratio_norm_postbleach1)
+
+for (cl in unique(frap_individual_export$cell_line)) {
+  out_file <- file.path(
+    export_folder,
+    paste0(cl, "_", replicate_label, "_individual_curves.csv")
+  )
+
+  frap_individual_export %>%
+    filter(cell_line == cl) %>%
+    write_csv(out_file)
+}
+
+# list what was written, for confirmation
+list.files(export_folder, pattern = paste0(replicate_label, "_individual_curves\\.csv$"), full.names = TRUE)
+```

@@ -1,0 +1,12 @@
+setAutoThreshold("Default dark no-reset");
+run("Threshold...");
+setThreshold(1, 255);
+setOption("BlackBackground", true);
+run("Convert to Mask");
+run("Analyze Particles...", "add");
+roiManager("Select", 2);
+roiManager("Rename", "background");
+roiManager("Select", 0);
+roiManager("Rename", "untargeted_1");
+roiManager("Select", 1);
+roiManager("Rename", "targeted_1");
